@@ -1,47 +1,57 @@
-# Executive Project & Decision Command Center (MVP)
+# Executive Project & Decision Command Center (MVP Web App)
 
-A production-minded MVP SaaS for busy executives running multiple high-stakes initiatives.
+A clean, local-first SaaS MVP for executives managing high-stakes initiatives.
 
-## Stack choice (and why)
+## What changed
 
-I chose a **Python + SQLite + server-rendered WSGI** stack for this MVP:
+This implementation is now a **proper web app experience** with:
+- A modern app shell (sidebar nav + top search bar)
+- Structured pages for Dashboard, Projects, Decisions, Action Items, Risks, Stakeholders, War Room Brief, and Admin Users
+- Role-aware behavior (ADMIN / EXEC / MEMBER)
+- Better auth security via salted PBKDF2 password hashing
+- Seeded demo dataset for immediate exploration
 
-- **Python stdlib web server (`wsgiref`)**: zero external paid services, very low setup friction, and fast local iteration.
-- **SQLite (`sqlite3`)**: ideal for local development; schema is normalized and SQL-first so a future swap to Postgres is straightforward.
-- **Thin domain modules** (`auth`, `rbac`, `models`) with unit tests: keeps core business rules maintainable and easy to migrate into a larger framework later.
+## Stack
 
-> This is intentionally simple and pilot-focused while preserving core production concerns: auth, RBAC, validation, entity integrity, and audit/activity events.
+- **Python standard library web server (`wsgiref`)** for zero-dependency local runtime
+- **SQLite** for local data with relational schema that can be migrated later
+- **Pytest** for domain-level and auth tests
 
-## Features included
+> Why this stack: package registry access in constrained environments can be blocked; this approach still ships a functional, testable web MVP that runs with one command.
 
-- Email/password auth (signup/login/logout)
-- RBAC roles: `ADMIN`, `EXEC`, `MEMBER`
-- Dashboard with:
+## Core capabilities
+
+- Auth: signup/login/logout (session cookies)
+- RBAC:
+  - ADMIN: full access + user management
+  - EXEC: view all and manage owned work
+  - MEMBER: focused scope and owned-item edits
+- Dashboard cards:
   - projects by status
   - open decisions
-  - overdue action items
-  - top risk/issues by score
+  - overdue tasks
+  - top risks/issues
 - Projects:
   - list + filters
-  - create
-  - detail page with linked decisions/action items/risks/stakeholders and activity log
+  - detail view with linked records and activity log
 - Decisions:
-  - list + create
-  - status workflow including **Mark DECIDED** validation (requires outcome + decision_date)
+  - full decision records
+  - status transition workflow
+  - `DECIDED` requires outcome + decision date
 - Action items:
-  - table list + create
+  - tabular queue + create
 - Risks/issues:
-  - table sorted by computed score
-  - create
-- Stakeholders directory + create
-- War Room Brief weekly summary with **copy-to-clipboard** export
-- Global search across project/decision/action titles
-- Activity log for project and decision create/update events
-- Seed script with demo users + data
+  - sorted by score (`probability * impact`)
+- Stakeholders:
+  - directory + add
+- War Room Brief:
+  - generated weekly summary
+  - copy-to-clipboard export
+- Global search over titles (projects/decisions/actions)
 
 ## Data model
 
-Implemented entities:
+Implemented tables:
 - `users`
 - `projects`
 - `decisions`
@@ -52,39 +62,38 @@ Implemented entities:
 - `activity_logs`
 - `sessions`
 
-Schema and constraints are in `app/schema.sql`.
+See: `app/schema.sql`
 
 ## Project structure
 
 ```text
 app/
-  main.py          # WSGI app + routes + HTML views
-  db.py            # DB connection + migration helpers
-  auth.py          # password hashing + session handling
-  rbac.py          # role/permission checks
+  main.py          # web routes + rendered pages
+  db.py            # db connection + migration bootstrap
+  auth.py          # auth + password hashing + session utilities
+  rbac.py          # role checks
   models.py        # domain rules (decision transitions, risk score)
-  schema.sql       # SQL schema (SQLite now, Postgres-friendly design)
+  schema.sql       # db schema
 scripts/
-  seed.py          # demo data bootstrap
+  seed.py          # demo users + sample records
 tests/
-  test_domain.py   # unit tests (decision transitions, risk score, RBAC)
-requirements.txt
-README.md
+  test_domain.py   # decision/risk/RBAC tests
+  test_auth.py     # password hashing tests
 ```
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.10+
 
-## One-command local start
+## One-command start
 
 ```bash
 python app/main.py
 ```
 
-Then open: `http://localhost:8000`
+Open `http://localhost:8000`.
 
-## Setup + seed demo data
+## Setup + demo data
 
 ```bash
 python -m venv .venv
@@ -94,12 +103,12 @@ python scripts/seed.py
 python app/main.py
 ```
 
-Demo accounts after seeding:
-- `admin@demo.com / password123` (ADMIN)
-- `exec@demo.com / password123` (EXEC)
-- `member@demo.com / password123` (MEMBER)
+Demo users:
+- `admin@demo.com / password123`
+- `exec@demo.com / password123`
+- `member@demo.com / password123`
 
-## Run tests
+## Tests
 
 ```bash
 PYTHONPATH=. pytest -q
@@ -107,26 +116,11 @@ PYTHONPATH=. pytest -q
 
 ## Environment variables
 
-No required env vars for local execution in this MVP.
+None required for local run.
 
-(If you want, next step can add `DATABASE_URL` and `SECRET_KEY` env support for deployment hardening.)
+## Postgres migration path (later)
 
-## RBAC rules (implemented)
-
-- **ADMIN**: can manage users and edit/view all records.
-- **EXEC**: can view all records; can create new entries; can edit owned records.
-- **MEMBER**: scoped views for owned records in key pages; can edit owned tasks; decisions are owner-editable only.
-
-## Validation and defaults
-
-- DB-level CHECK constraints for enums and score inputs.
-- Decision transition guardrails in `validate_decision_transition`.
-- Risk score computed as `probability * impact`.
-- Safe default statuses and nullable due dates where appropriate.
-
-## Notes for Postgres migration
-
-- Keep table/column names unchanged.
-- Convert `INTEGER PRIMARY KEY AUTOINCREMENT` to `BIGSERIAL` or identity columns.
-- Replace SQLite date helpers with Postgres `CURRENT_DATE` equivalents.
-- Add migration tooling (Alembic/Flyway/Prisma) in a future phase.
+- Keep same table names/columns
+- Replace SQLite autoincrement with Postgres identity columns
+- Swap SQL date funcs to Postgres equivalents
+- Introduce migration tool (Alembic/Flyway) in next phase
