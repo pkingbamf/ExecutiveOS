@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sqlite3
 
 
 @dataclass(frozen=True)
@@ -32,3 +33,9 @@ def validate_decision_transition(current: str, target: str, outcome: str = "", d
     if target == "DECIDED" and (not outcome.strip() or not decision_date):
         return False, "Marking DECIDED requires decision_outcome and decision_date"
     return True, "ok"
+
+
+def dashboard_open_decision_count(conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) c FROM decisions WHERE deleted_at IS NULL AND status IN ('PROPOSED','REVISIT')"
+    ).fetchone()["c"]

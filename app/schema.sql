@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('ADMIN','EXEC','MEMBER')),
+  is_active INTEGER NOT NULL DEFAULT 1,
+  must_change_password INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -20,6 +22,7 @@ CREATE TABLE IF NOT EXISTS projects (
   start_date TEXT,
   target_date TEXT,
   tags TEXT NOT NULL DEFAULT '[]',
+  deleted_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -38,6 +41,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   decision_outcome TEXT NOT NULL DEFAULT '',
   due_date TEXT,
   impact_level TEXT NOT NULL CHECK(impact_level IN ('LOW','MED','HIGH')) DEFAULT 'MED',
+  deleted_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -51,6 +55,7 @@ CREATE TABLE IF NOT EXISTS action_items (
   status TEXT NOT NULL CHECK(status IN ('OPEN','IN_PROGRESS','DONE','CANCELLED')) DEFAULT 'OPEN',
   due_date TEXT,
   notes TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -64,6 +69,7 @@ CREATE TABLE IF NOT EXISTS stakeholders (
   influence_level TEXT NOT NULL CHECK(influence_level IN ('LOW','MED','HIGH')) DEFAULT 'MED',
   stance TEXT NOT NULL CHECK(stance IN ('SUPPORTIVE','NEUTRAL','RESISTANT')) DEFAULT 'NEUTRAL',
   notes TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -71,6 +77,7 @@ CREATE TABLE IF NOT EXISTS project_stakeholders (
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   stakeholder_id INTEGER NOT NULL REFERENCES stakeholders(id) ON DELETE CASCADE,
   relationship_notes TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT,
   PRIMARY KEY(project_id, stakeholder_id)
 );
 
@@ -86,6 +93,7 @@ CREATE TABLE IF NOT EXISTS risk_issues (
   owner_user_id INTEGER NOT NULL REFERENCES users(id),
   mitigation_plan TEXT NOT NULL DEFAULT '',
   due_date TEXT,
+  deleted_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

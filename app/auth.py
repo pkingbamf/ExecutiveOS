@@ -18,30 +18,34 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, stored_hash: str) -> bool:
     if stored_hash.startswith("pbkdf2_sha256$"):
         _, salt_hex, digest_hex = stored_hash.split("$", 2)
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(digest_hex)
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 120_000)
-        return hmac.compare_digest(actual, expected)
-    # legacy fallback
-    legacy = hashlib.sha256(password.encode()).hexdigest()
-    return hmac.compare_digest(legacy, stored_hash)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 120_000)
+        return hmac.compare_digest(actual, bytes.fromhex(digest_hex))
+    return hmac.compare_digest(hashlib.sha256(password.encode()).hexdigest(), stored_hash)
 
 
-def create_user(name: str, email: str, password: str, role: str = "MEMBER"):
+def create_user(name: str, email: str, password: str, role: str = "MEMBER", must_change_password: bool = False):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)",
-            (name.strip(), email.lower().strip(), hash_password(password), role),
+            "INSERT INTO users(name,email,password_hash,role,must_change_password) VALUES(?,?,?,?,?)",
+            (name.strip(), email.lower().strip(), hash_password(password), role, int(must_change_password)),
+        )
+
+
+def update_password(user_id: int, new_password: str, must_change_password: bool = False):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash=?, must_change_password=? WHERE id=?",
+            (hash_password(new_password), int(must_change_password), user_id),
         )
 
 
 def authenticate(email: str, password: str) -> User | None:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id,name,email,role,password_hash FROM users WHERE email = ?",
+            "SELECT id,name,email,role,password_hash,is_active FROM users WHERE email = ?",
             (email.lower().strip(),),
         ).fetchone()
-    if not row or not verify_password(password, row["password_hash"]):
+    if not row or row["is_active"] != 1 or not verify_password(password, row["password_hash"]):
         return None
     return User(id=row["id"], name=row["name"], email=row["email"], role=row["role"])
 
@@ -58,12 +62,7 @@ def get_user_by_session(token: str | None) -> User | None:
         return None
     with get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT u.id,u.name,u.email,u.role
-            FROM sessions s
-            JOIN users u ON u.id = s.user_id
-            WHERE s.token = ?
-            """,
+            "SELECT u.id,u.name,u.email,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?",
             (token,),
         ).fetchone()
     if not row:

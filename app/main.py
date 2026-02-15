@@ -11,9 +11,9 @@ from datetime import date
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
-from app.auth import authenticate, create_session, create_user, destroy_session, get_user_by_session
+from app.auth import authenticate, create_session, create_user, destroy_session, get_user_by_session, update_password
 from app.db import get_conn, migrate
-from app.models import validate_decision_transition
+from app.models import dashboard_open_decision_count, validate_decision_transition
 from app.rbac import can_edit_owned_or_admin, can_manage_users, can_view_all
 
 PROJECT_STATUS = {"NOT_STARTED", "IN_PROGRESS", "AT_RISK", "BLOCKED", "DONE"}
@@ -24,6 +24,7 @@ ACTION_STATUS = {"OPEN", "IN_PROGRESS", "DONE", "CANCELLED"}
 RISK_TYPES = {"RISK", "ISSUE"}
 RISK_STATUS = {"OPEN", "MITIGATED", "CLOSED"}
 IMPACT_LEVELS = {"LOW", "MED", "HIGH"}
+STANCE = {"SUPPORTIVE", "NEUTRAL", "RESISTANT"}
 
 
 def parse_form(environ):
@@ -61,9 +62,25 @@ def safe_choice(value: str, allowed: set[str], default: str) -> str:
     return value if value in allowed else default
 
 
-def layout(user, title: str, body: str):
+def can_delete(user, owner_user_id=None) -> bool:
+    if user.role == "ADMIN":
+        return True
+    return user.role == "EXEC" and owner_user_id is not None and user.id == owner_user_id
+
+
+def row_action_delete(path: str, typed: bool = False):
+    if typed:
+        return f"<form method='POST' action='{path}' onsubmit=\"var v=prompt('Type DELETE to confirm');if(v!=='DELETE')return false;\"><button>Delete</button></form>"
+    return f"<form method='POST' action='{path}' onsubmit=\"return confirm('Delete this item?')\"><button>Delete</button></form>"
+
+
+def toast_message(environ):
+    t = parse_qs(environ.get("QUERY_STRING", "")).get("toast", [""])[0]
+    return f"<div class='toast'>{html.escape(t)}</div>" if t else ""
+
+
+def layout(user, title: str, body: str, toast: str = ""):
     nav = ""
-    search = ""
     if user:
         nav = """
         <aside class='sidebar'>
@@ -74,51 +91,27 @@ def layout(user, title: str, body: str):
           <a href='/actions'>Action Items</a>
           <a href='/risks'>Risks & Issues</a>
           <a href='/stakeholders'>Stakeholders</a>
-          <a href='/war-room'>War Room Brief</a>
           <a href='/admin/users'>Users</a>
           <a href='/logout'>Logout</a>
         </aside>
         """
-        search = f"""
-        <header class='topbar'>
-          <form action='/search' method='GET'>
-            <input name='q' placeholder='Search projects, decisions, actions' />
-            <button>Search</button>
-          </form>
-          <div class='pill'>{html.escape(user.name)} · {html.escape(user.role)}</div>
-        </header>
-        """
+    search = ""
+    if user:
+        search = f"<header class='topbar'><form action='/search' method='GET'><input name='q' placeholder='Search projects, decisions, actions'><button>Search</button></form><div class='pill'>{html.escape(user.name)} · {html.escape(user.role)}</div></header>"
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>
+    body{{margin:0;font-family:Inter,Arial;background:#f3f5f9;color:#111827}}.app{{display:flex;min-height:100vh}}.sidebar{{width:220px;background:#0f172a;padding:18px;display:flex;flex-direction:column;gap:8px}}
+    .sidebar a{{color:#cbd5e1;text-decoration:none;padding:8px;border-radius:8px}}.sidebar a:hover{{background:#1e293b}}.main{{flex:1;padding:18px}}.topbar{{display:flex;justify-content:space-between;gap:12px;margin-bottom:12px}}
+    .topbar form{{display:flex;gap:8px;flex:1}}.card{{background:#fff;padding:14px;border:1px solid #e5e7eb;border-radius:12px;margin-bottom:12px}} table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left}}
+    input,select,textarea{{width:100%;padding:9px;border:1px solid #e5e7eb;border-radius:8px}}button{{padding:8px 12px;border:none;background:#1d4ed8;color:#fff;border-radius:8px;cursor:pointer}}form.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}
+    .kpis{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}}.kpi{{background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:10px}} .pill{{background:#fff;border:1px solid #e5e7eb;padding:8px 10px;border-radius:999px}}
+    .toast{{background:#dcfce7;border:1px solid #86efac;padding:10px;border-radius:8px;margin-bottom:10px}}
+    </style></head><body><div class='app'>{nav}<main class='main'>{search}{toast}<h1>{html.escape(title)}</h1>{body}</main></div></body></html>"""
 
-    return f"""<!doctype html><html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/><title>{html.escape(title)}</title>
-    <style>
-    :root {{ --bg:#f3f5f9; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb; --brand:#1d4ed8; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; font-family:Inter,system-ui,-apple-system,sans-serif; color:var(--text); background:var(--bg); }}
-    .app {{ display:flex; min-height:100vh; }}
-    .sidebar {{ width:230px; background:#0f172a; color:#fff; padding:20px; display:flex; flex-direction:column; gap:8px; }}
-    .sidebar a {{ color:#cbd5e1; text-decoration:none; padding:8px 10px; border-radius:8px; }}
-    .sidebar a:hover {{ background:#1e293b; color:#fff; }}
-    .main {{ flex:1; padding:20px; }}
-    .topbar {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }}
-    .topbar form {{ display:flex; gap:8px; flex:1; max-width:650px; }}
-    .pill {{ background:#fff; border:1px solid var(--line); border-radius:999px; padding:8px 12px; color:var(--muted); }}
-    .card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; box-shadow:0 1px 2px rgba(0,0,0,.05); }}
-    .kpis {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }}
-    .kpi {{ background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px; padding:12px; font-size:14px; }}
-    h1,h2,h3,h4 {{ margin:0 0 12px 0; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th,td {{ border-bottom:1px solid var(--line); text-align:left; padding:10px 8px; font-size:14px; vertical-align:top; }}
-    form.grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }}
-    input,select,textarea,button {{ font:inherit; }}
-    input,select,textarea {{ width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; background:#fff; }}
-    textarea {{ min-height:90px; }}
-    button {{ background:var(--brand); color:#fff; border:none; border-radius:8px; padding:10px 14px; cursor:pointer; }}
-    .muted {{ color:var(--muted); }}
-    .row {{ display:flex; gap:12px; }}
-    .row > .card {{ flex:1; }}
-    .tag {{ padding:2px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; font-size:12px; }}
-    </style></head><body>
-    <div class='app'>{nav}<main class='main'>{search}<h1>{html.escape(title)}</h1>{body}</main></div></body></html>"""
+
+def must_change_password(user_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute("SELECT must_change_password FROM users WHERE id=?", (user_id,)).fetchone()
+    return bool(row and row["must_change_password"] == 1)
 
 
 def app(environ, start_response):
@@ -132,22 +125,21 @@ def app(environ, start_response):
     if path == "/signup":
         if method == "POST":
             form = parse_form(environ)
-            if not form.get("name") or not form.get("email") or not form.get("password"):
-                return respond(start_response, layout(user, "Sign up", "<div class='card'>All fields are required.</div>"), "400 Bad Request")
-            create_user(form["name"], form["email"], form["password"], "MEMBER")
+            create_user(form.get("name", ""), form.get("email", ""), form.get("password", ""), "MEMBER")
             return redirect(start_response, "/login")
-        return respond(start_response, layout(user, "Sign up", "<div class='card'><form method='POST'><input name='name' placeholder='Name' required><input name='email' type='email' placeholder='Email' required><input name='password' type='password' placeholder='Password' required><button>Create account</button></form><p class='muted'>Already have an account? <a href='/login'>Login</a></p></div>"))
+        return respond(start_response, layout(user, "Sign up", "<div class='card'><form method='POST'><input name='name' required><input type='email' name='email' required><input type='password' name='password' required><button>Create account</button></form></div>"))
 
     if path == "/login":
         if method == "POST":
             form = parse_form(environ)
             auth_user = authenticate(form.get("email", ""), form.get("password", ""))
             if not auth_user:
-                return respond(start_response, layout(user, "Login", "<div class='card'>Invalid credentials.</div>"), "401 Unauthorized")
+                return respond(start_response, layout(user, "Login", "<div class='card'>Invalid credentials or inactive account.</div>"), "401 Unauthorized")
             token = create_session(auth_user.id)
-            start_response("302 Found", [("Location", "/dashboard"), ("Set-Cookie", f"session={token}; HttpOnly; Path=/")])
+            target = "/change-password" if must_change_password(auth_user.id) else "/dashboard"
+            start_response("302 Found", [("Location", target), ("Set-Cookie", f"session={token}; HttpOnly; Path=/")])
             return [b""]
-        return respond(start_response, layout(user, "Login", "<div class='card'><form method='POST'><input name='email' type='email' placeholder='Email' required><input name='password' type='password' placeholder='Password' required><button>Login</button></form><p class='muted'>No account yet? <a href='/signup'>Create one</a></p></div>"))
+        return respond(start_response, layout(user, "Login", "<div class='card'><form method='POST'><input type='email' name='email' required><input type='password' name='password' required><button>Login</button></form><a href='/signup'>Sign up</a></div>"))
 
     if path == "/logout":
         destroy_session(get_cookie(environ, "session"))
@@ -157,298 +149,261 @@ def app(environ, start_response):
     if not user:
         return redirect(start_response, "/login")
 
+    if must_change_password(user.id) and path != "/change-password":
+        return redirect(start_response, "/change-password")
+
+    if path == "/change-password":
+        if method == "POST":
+            form = parse_form(environ)
+            if not form.get("new_password"):
+                return respond(start_response, layout(user, "Change password", "<div class='card'>Password required.</div>"), "400 Bad Request")
+            update_password(user.id, form["new_password"], must_change_password=False)
+            return redirect(start_response, "/dashboard?toast=Password%20updated")
+        return respond(start_response, layout(user, "Change password", "<div class='card'><p>You must change your password.</p><form method='POST'><input type='password' name='new_password' required><button>Update password</button></form></div>"))
+
     if path == "/dashboard":
         with get_conn() as conn:
-            status_rows = conn.execute("SELECT status, COUNT(*) c FROM projects GROUP BY status").fetchall()
-            decisions_open = conn.execute("SELECT COUNT(*) c FROM decisions WHERE status IN ('PROPOSED','REVISIT')").fetchone()["c"]
-            overdue_actions = conn.execute("SELECT COUNT(*) c FROM action_items WHERE status != 'DONE' AND due_date < date('now')").fetchone()["c"]
-            top_risks = conn.execute("SELECT title, probability*impact score, type FROM risk_issues ORDER BY score DESC LIMIT 5").fetchall()
-
-        kpi_cards = ''.join([f"<div class='kpi'><strong>{r['status']}</strong><br>{r['c']} projects</div>" for r in status_rows])
-        risks = ''.join([f"<tr><td>{html.escape(r['title'])}</td><td>{r['type']}</td><td>{r['score']}</td></tr>" for r in top_risks])
-        body = f"""
-        <div class='kpis'>{kpi_cards}<div class='kpi'><strong>Open decisions</strong><br>{decisions_open}</div><div class='kpi'><strong>Overdue tasks</strong><br>{overdue_actions}</div></div>
-        <div class='row'>
-          <div class='card'><h3>Top risks / issues</h3><table><tr><th>Title</th><th>Type</th><th>Score</th></tr>{risks}</table></div>
-          <div class='card'><h3>Quick add</h3><p><a href='/projects'>New Project</a></p><p><a href='/decisions'>New Decision</a></p><p><a href='/actions'>New Action Item</a></p><p><a href='/risks'>New Risk/Issue</a></p></div>
-        </div>
-        """
-        return respond(start_response, layout(user, "Executive Dashboard", body))
+            statuses = conn.execute("SELECT status,COUNT(*) c FROM projects WHERE deleted_at IS NULL GROUP BY status").fetchall()
+            open_decisions = dashboard_open_decision_count(conn)
+            overdue = conn.execute("SELECT COUNT(*) c FROM action_items WHERE deleted_at IS NULL AND status!='DONE' AND due_date < date('now')").fetchone()["c"]
+            top_risks = conn.execute("SELECT title,type,probability*impact score FROM risk_issues WHERE deleted_at IS NULL ORDER BY score DESC LIMIT 5").fetchall()
+            decided_7 = conn.execute("SELECT COUNT(*) c FROM decisions WHERE deleted_at IS NULL AND status='DECIDED' AND decision_date >= date('now','-7 day')").fetchone()["c"]
+            decided_30 = conn.execute("SELECT COUNT(*) c FROM decisions WHERE deleted_at IS NULL AND status='DECIDED' AND decision_date >= date('now','-30 day')").fetchone()["c"]
+            recent_decided = conn.execute("SELECT d.title,d.decision_date,COALESCE(p.title,'Org-level') project_title FROM decisions d LEFT JOIN projects p ON p.id=d.project_id WHERE d.deleted_at IS NULL AND d.status='DECIDED' ORDER BY d.decision_date DESC LIMIT 5").fetchall()
+        kpi = ''.join([f"<div class='kpi'><b>{r['status']}</b><br>{r['c']} projects</div>" for r in statuses])
+        kpi += f"<div class='kpi'><b>Open decisions</b><br>{open_decisions}</div><div class='kpi'><b>Overdue actions</b><br>{overdue}</div><div class='kpi'><b>Decided (7d / 30d)</b><br>{decided_7} / {decided_30}</div>"
+        risks = ''.join([f"<tr><td>{html.escape(r['title'])}</td><td>{r['type']}</td><td>{r['score']}</td></tr>" for r in top_risks]) or "<tr><td colspan='3'>No risks or issues.</td></tr>"
+        decided_rows = ''.join([f"<li>{html.escape(d['title'])} · {html.escape(d['project_title'])} · {d['decision_date']}</li>" for d in recent_decided]) or "<li>No recent decided decisions.</li>"
+        body = f"<div class='kpis'>{kpi}</div><div class='card'><h3>Top risks/issues</h3><table><tr><th>Title</th><th>Type</th><th>Score</th></tr>{risks}</table></div><div class='card'><h3>Recent decisions made</h3><ul>{decided_rows}</ul></div>"
+        return respond(start_response, layout(user, "Executive Dashboard", body, toast_message(environ)))
 
     if path == "/projects":
         if method == "POST":
             form = parse_form(environ)
-            owner = int(form.get("owner_user_id", user.id))
-            if user.role == "MEMBER":
-                owner = user.id
+            owner = user.id if user.role == "MEMBER" else int(form.get("owner_user_id", user.id))
             with get_conn() as conn:
-                cur = conn.execute(
-                    "INSERT INTO projects(title,short_description,status,priority,owner_user_id,sponsor_name,start_date,target_date,tags) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        form.get("title", "").strip(),
-                        form.get("short_description", "").strip(),
-                        safe_choice(form.get("status", "NOT_STARTED"), PROJECT_STATUS, "NOT_STARTED"),
-                        safe_choice(form.get("priority", "P2"), PROJECT_PRIORITY, "P2"),
-                        owner,
-                        form.get("sponsor_name", "").strip(),
-                        form.get("start_date") or None,
-                        form.get("target_date") or None,
-                        json.dumps([t.strip() for t in form.get("tags", "").split(",") if t.strip()]),
-                    ),
-                )
-                conn.execute("INSERT INTO activity_logs(entity_type,entity_id,action,actor_user_id) VALUES('PROJECT',?,?,?)", (cur.lastrowid, "CREATE", user.id))
-
-        qs = parse_qs(environ.get("QUERY_STRING", ""))
-        where, args = [], []
-        for field in ["status", "priority", "owner_user_id"]:
-            if qs.get(field):
-                where.append(f"p.{field} = ?")
-                args.append(qs[field][0])
-        if qs.get("tags"):
-            where.append("p.tags LIKE ?")
-            args.append(f"%{qs['tags'][0]}%")
-        if not can_view_all(user):
-            where.insert(0, "p.owner_user_id = ?")
-            args.insert(0, user.id)
-
-        clause = f"WHERE {' AND '.join(where)}" if where else ""
+                conn.execute("INSERT INTO projects(title,short_description,status,priority,owner_user_id,sponsor_name,start_date,target_date,tags) VALUES(?,?,?,?,?,?,?,?,?)", (
+                    form.get("title", ""), form.get("short_description", ""), safe_choice(form.get("status", "NOT_STARTED"), PROJECT_STATUS, "NOT_STARTED"), safe_choice(form.get("priority", "P2"), PROJECT_PRIORITY, "P2"), owner, form.get("sponsor_name", ""), form.get("start_date") or None, form.get("target_date") or None, json.dumps([t.strip() for t in form.get("tags", "").split(",") if t.strip()]),
+                ))
         with get_conn() as conn:
-            rows = conn.execute(f"SELECT p.*, u.name owner_name FROM projects p JOIN users u ON u.id=p.owner_user_id {clause} ORDER BY p.updated_at DESC", args).fetchall()
-            users = conn.execute("SELECT id,name FROM users ORDER BY name").fetchall()
+            rows = conn.execute("SELECT p.*,u.name owner_name FROM projects p JOIN users u ON u.id=p.owner_user_id WHERE p.deleted_at IS NULL ORDER BY p.updated_at DESC").fetchall()
+            users = conn.execute("SELECT id,name FROM users WHERE is_active=1 ORDER BY name").fetchall()
+        if not can_view_all(user):
+            rows = [r for r in rows if r["owner_user_id"] == user.id]
+        project_rows = []
+        for r in rows:
+            action = row_action_delete(f"/projects/{r['id']}/delete", True) if can_delete(user, r['owner_user_id']) else '-'
+            project_rows.append(f"<tr><td><a href='/projects/{r['id']}'>{html.escape(r['title'])}</a></td><td>{r['status']}</td><td>{r['priority']}</td><td>{html.escape(r['owner_name'])}</td><td>{action}</td></tr>")
+        table = ''.join(project_rows) or "<tr><td colspan='5'>No projects found.</td></tr>"
+        owners = ''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users])
+        body = f"<div class='card'><table><tr><th>Title</th><th>Status</th><th>Priority</th><th>Owner</th><th>Actions</th></tr>{table}</table></div><div class='card'><h3>New project</h3><form method='POST' class='grid'><input name='title' required><input name='short_description'><select name='status'><option>NOT_STARTED</option><option>IN_PROGRESS</option><option>AT_RISK</option><option>BLOCKED</option><option>DONE</option></select><select name='priority'><option>P0</option><option>P1</option><option>P2</option><option>P3</option></select><select name='owner_user_id'>{owners}</select><input name='sponsor_name'><input type='date' name='start_date'><input type='date' name='target_date'><input name='tags' placeholder='comma tags'><button>Create</button></form></div>"
+        return respond(start_response, layout(user, "Projects", body, toast_message(environ)))
 
-        table = ''.join([f"<tr><td><a href='/projects/{p['id']}'>{html.escape(p['title'])}</a></td><td><span class='tag'>{p['status']}</span></td><td>{p['priority']}</td><td>{html.escape(p['owner_name'])}</td></tr>" for p in rows])
-        owner_opts = ''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users])
-        body = f"""
-        <div class='card'><h3>Filters</h3><form method='GET' class='grid'><input name='status' placeholder='Status'><input name='priority' placeholder='Priority'><input name='owner_user_id' placeholder='Owner ID'><input name='tags' placeholder='Tag'><button>Apply</button></form></div>
-        <div class='card'><h3>Projects</h3><table><tr><th>Title</th><th>Status</th><th>Priority</th><th>Owner</th></tr>{table}</table></div>
-        <div class='card'><h3>New project</h3><form method='POST' class='grid'>
-          <input name='title' required placeholder='Project title'><input name='short_description' placeholder='Short description'>
-          <select name='status'><option>NOT_STARTED</option><option>IN_PROGRESS</option><option>AT_RISK</option><option>BLOCKED</option><option>DONE</option></select>
-          <select name='priority'><option>P0</option><option>P1</option><option selected>P2</option><option>P3</option></select>
-          <select name='owner_user_id'>{owner_opts}</select><input name='sponsor_name' placeholder='Sponsor'>
-          <input type='date' name='start_date'><input type='date' name='target_date'>
-          <input name='tags' placeholder='comma-separated tags'><button>Create project</button>
-        </form></div>
-        """
-        return respond(start_response, layout(user, "Projects", body))
+    if path.startswith("/projects/") and path.endswith("/delete") and method == "POST":
+        pid = int(path.split("/")[2])
+        with get_conn() as conn:
+            p = conn.execute("SELECT id,owner_user_id FROM projects WHERE id=? AND deleted_at IS NULL", (pid,)).fetchone()
+            if not p or not can_delete(user, p["owner_user_id"]):
+                return respond(start_response, layout(user, "Forbidden", "<div class='card'>Not allowed.</div>"), "403 Forbidden")
+            conn.execute("UPDATE projects SET deleted_at=CURRENT_TIMESTAMP WHERE id=?", (pid,))
+            conn.execute("UPDATE decisions SET deleted_at=CURRENT_TIMESTAMP WHERE project_id=?", (pid,))
+            conn.execute("UPDATE action_items SET deleted_at=CURRENT_TIMESTAMP WHERE project_id=?", (pid,))
+            conn.execute("UPDATE risk_issues SET deleted_at=CURRENT_TIMESTAMP WHERE project_id=?", (pid,))
+            conn.execute("UPDATE project_stakeholders SET deleted_at=CURRENT_TIMESTAMP WHERE project_id=?", (pid,))
+        return redirect(start_response, "/projects?toast=Project%20deleted")
 
     if path.startswith("/projects/"):
         pid = int(path.split("/")[-1])
         with get_conn() as conn:
-            project = conn.execute("SELECT p.*,u.name owner_name FROM projects p JOIN users u ON u.id=p.owner_user_id WHERE p.id=?", (pid,)).fetchone()
-            if not project:
-                return respond(start_response, layout(user, "Not found", "<div class='card'>Project not found.</div>"), "404 Not Found")
-            if not can_view_all(user) and project["owner_user_id"] != user.id:
-                return respond(start_response, layout(user, "Forbidden", "<div class='card'>Access denied.</div>"), "403 Forbidden")
-            decisions = conn.execute("SELECT title,status FROM decisions WHERE project_id=?", (pid,)).fetchall()
-            actions = conn.execute("SELECT title,status,due_date FROM action_items WHERE project_id=?", (pid,)).fetchall()
-            risks = conn.execute("SELECT title,status,probability*impact score FROM risk_issues WHERE project_id=? ORDER BY score DESC", (pid,)).fetchall()
-            stakeholders = conn.execute("SELECT s.name,ps.relationship_notes FROM stakeholders s JOIN project_stakeholders ps ON s.id=ps.stakeholder_id WHERE ps.project_id=?", (pid,)).fetchall()
-            logs = conn.execute("SELECT action,created_at FROM activity_logs WHERE entity_type='PROJECT' AND entity_id=? ORDER BY created_at DESC", (pid,)).fetchall()
-
-        decisions_html = ''.join([f"<li>{html.escape(d['title'])} ({d['status']})</li>" for d in decisions])
-        actions_html = ''.join([f"<li>{html.escape(a['title'])} [{a['status']}] due {a['due_date'] or '-'}</li>" for a in actions])
-        risks_html = ''.join([f"<li>{html.escape(r['title'])} score {r['score']} ({r['status']})</li>" for r in risks])
-        stakeholders_html = ''.join([f"<li>{html.escape(s['name'])} - {html.escape(s['relationship_notes'] or '')}</li>" for s in stakeholders])
-        logs_html = ''.join([f"<li>{l['created_at']}: {l['action']}</li>" for l in logs])
-        body = f"<div class='card'><p>{html.escape(project['short_description'])}</p><p>Owner: {html.escape(project['owner_name'])} · Status: {project['status']} · Priority: {project['priority']}</p><p>Timeline: {project['start_date'] or '-'} → {project['target_date'] or '-'}</p></div>"
-        body += f"<div class='row'><div class='card'><h4>Decisions</h4><ul>{decisions_html}</ul></div><div class='card'><h4>Action items</h4><ul>{actions_html}</ul></div></div>"
-        body += f"<div class='row'><div class='card'><h4>Risks</h4><ul>{risks_html}</ul></div><div class='card'><h4>Stakeholders</h4><ul>{stakeholders_html}</ul></div></div>"
-        body += f"<div class='card'><h4>Activity log</h4><ul>{logs_html}</ul></div>"
-        return respond(start_response, layout(user, f"Project: {project['title']}", body))
+            p = conn.execute("SELECT p.*,u.name owner_name FROM projects p JOIN users u ON u.id=p.owner_user_id WHERE p.id=? AND p.deleted_at IS NULL", (pid,)).fetchone()
+            if not p:
+                return respond(start_response, layout(user, "Not found", "<div class='card'>This item was deleted or not found.</div>"), "404 Not Found")
+            if not can_view_all(user) and p["owner_user_id"] != user.id:
+                return respond(start_response, layout(user, "Forbidden", "<div class='card'>Forbidden.</div>"), "403 Forbidden")
+            decisions = conn.execute("SELECT title,status FROM decisions WHERE project_id=? AND deleted_at IS NULL", (pid,)).fetchall()
+            actions = conn.execute("SELECT title,status,due_date FROM action_items WHERE project_id=? AND deleted_at IS NULL", (pid,)).fetchall()
+            risks = conn.execute("SELECT title,probability*impact score,status FROM risk_issues WHERE project_id=? AND deleted_at IS NULL ORDER BY score DESC", (pid,)).fetchall()
+        delete_ui = row_action_delete(f"/projects/{pid}/delete", True) if can_delete(user, p["owner_user_id"]) else ""
+        body = f"<div class='card'><p>{html.escape(p['short_description'])}</p><p>Status {p['status']} · Priority {p['priority']} · Owner {html.escape(p['owner_name'])}</p>{delete_ui}</div>"
+        decisions_html = ''.join([f"<li>{html.escape(d['title'])} ({d['status']})</li>" for d in decisions]) or '<li>No linked decisions.</li>'
+        actions_html = ''.join([f"<li>{html.escape(a['title'])} [{a['status']}] {a['due_date'] or ''}</li>" for a in actions]) or '<li>No linked actions.</li>'
+        risks_html = ''.join([f"<li>{html.escape(r['title'])} score {r['score']}</li>" for r in risks]) or '<li>No linked risks/issues.</li>'
+        body += f"<div class='card'><h4>Decisions</h4><ul>{decisions_html}</ul></div>"
+        body += f"<div class='card'><h4>Actions</h4><ul>{actions_html}</ul></div>"
+        body += f"<div class='card'><h4>Risks</h4><ul>{risks_html}</ul></div>"
+        return respond(start_response, layout(user, f"Project: {p['title']}", body, toast_message(environ)))
 
     if path == "/decisions":
         if method == "POST":
             form = parse_form(environ)
-            owner = int(form.get("owner_user_id", user.id))
-            if user.role == "MEMBER":
-                owner = user.id
+            owner = user.id if user.role == "MEMBER" else int(form.get("owner_user_id", user.id))
             with get_conn() as conn:
-                cur = conn.execute("INSERT INTO decisions(project_id,title,decision_type,status,owner_user_id,approver,rationale,options_considered,due_date,impact_level) VALUES(?,?,?,?,?,?,?,?,?,?)", (
-                    form.get("project_id") or None,
-                    form.get("title", "").strip(),
-                    safe_choice(form.get("decision_type", "STRATEGIC"), DECISION_TYPES, "STRATEGIC"),
-                    safe_choice(form.get("status", "PROPOSED"), DECISION_STATUS, "PROPOSED"),
-                    owner,
-                    form.get("approver", ""),
-                    form.get("rationale", ""),
-                    form.get("options_considered", ""),
-                    form.get("due_date") or None,
-                    safe_choice(form.get("impact_level", "MED"), IMPACT_LEVELS, "MED"),
+                conn.execute("INSERT INTO decisions(project_id,title,decision_type,status,owner_user_id,approver,rationale,options_considered,due_date,impact_level) VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                    form.get("project_id") or None, form.get("title", ""), safe_choice(form.get("decision_type", "STRATEGIC"), DECISION_TYPES, "STRATEGIC"), safe_choice(form.get("status", "PROPOSED"), DECISION_STATUS, "PROPOSED"), owner, form.get("approver", ""), form.get("rationale", ""), form.get("options_considered", ""), form.get("due_date") or None, safe_choice(form.get("impact_level", "MED"), IMPACT_LEVELS, "MED"),
                 ))
-                conn.execute("INSERT INTO activity_logs(entity_type,entity_id,action,actor_user_id) VALUES('DECISION',?,?,?)", (cur.lastrowid, "CREATE", user.id))
-
         with get_conn() as conn:
-            rows = conn.execute("SELECT d.*,u.name owner_name,p.title project_title FROM decisions d JOIN users u ON u.id=d.owner_user_id LEFT JOIN projects p ON p.id=d.project_id ORDER BY d.updated_at DESC").fetchall()
-            users = conn.execute("SELECT id,name FROM users ORDER BY name").fetchall()
-            projects = conn.execute("SELECT id,title FROM projects ORDER BY title").fetchall()
-
+            rows = conn.execute("SELECT d.*,u.name owner_name,COALESCE(p.title,'Org-level') project_title FROM decisions d JOIN users u ON u.id=d.owner_user_id LEFT JOIN projects p ON p.id=d.project_id WHERE d.deleted_at IS NULL ORDER BY d.updated_at DESC").fetchall()
+            users = conn.execute("SELECT id,name FROM users WHERE is_active=1 ORDER BY name").fetchall(); projects = conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL ORDER BY title").fetchall()
         if user.role == "MEMBER":
             rows = [r for r in rows if r["owner_user_id"] == user.id]
-        table = ''.join([f"<tr><td>{html.escape(d['title'])}</td><td>{d['decision_type']}</td><td>{d['status']}</td><td>{html.escape(d['owner_name'])}</td><td>{html.escape(d['project_title'] or 'Org-level')}</td><td><form method='POST' action='/decisions/{d['id']}/status'><select name='status'><option>PROPOSED</option><option>DECIDED</option><option>REVISIT</option><option>CANCELLED</option></select><input name='decision_outcome' placeholder='Outcome'><input type='date' name='decision_date'><button>Update</button></form></td></tr>" for d in rows])
-        user_opts = ''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users])
-        project_opts = ''.join([f"<option value='{p['id']}'>{html.escape(p['title'])}</option>" for p in projects])
-        body = f"""
-        <div class='card'><h3>Decisions</h3><table><tr><th>Decision</th><th>Type</th><th>Status</th><th>Owner</th><th>Project</th><th>Workflow</th></tr>{table}</table></div>
-        <div class='card'><h3>New decision</h3><form method='POST' class='grid'>
-          <input name='title' required placeholder='Decision statement'>
-          <select name='project_id'><option value=''>Org-level</option>{project_opts}</select>
-          <select name='decision_type'><option>STRATEGIC</option><option>FINANCIAL</option><option>OPERATIONAL</option><option>GOVERNANCE</option></select>
-          <select name='status'><option>PROPOSED</option><option>REVISIT</option></select>
-          <select name='owner_user_id'>{user_opts}</select><input name='approver' placeholder='Approver'>
-          <input type='date' name='due_date'><select name='impact_level'><option>LOW</option><option selected>MED</option><option>HIGH</option></select>
-          <textarea name='rationale' placeholder='Rationale'></textarea><textarea name='options_considered' placeholder='Options considered'></textarea>
-          <button>Create decision</button>
-        </form></div>
-        """
-        return respond(start_response, layout(user, "Decisions", body))
+        def close_button(d):
+            if not can_edit_owned_or_admin(user, d['owner_user_id']):
+                return ""
+            return f"<form method='POST' action='/decisions/{d['id']}/status' onsubmit=\"var o=prompt('Decision outcome (required)');if(!o)return false;var dt=prompt('Decision date YYYY-MM-DD','{date.today()}');if(!dt)return false;this.decision_outcome.value=o;this.decision_date.value=dt;return true;\"><input type='hidden' name='status' value='DECIDED'><input type='hidden' name='decision_outcome' value=''><input type='hidden' name='decision_date' value=''><button>Mark DECIDED</button></form>"
+        decision_rows=[]
+        for d in rows:
+            del_action = row_action_delete(f"/decisions/{d['id']}/delete", True) if can_delete(user, d['owner_user_id']) else ''
+            decision_rows.append(f"<tr><td>{html.escape(d['title'])}</td><td>{d['status']}</td><td>{html.escape(d['owner_name'])}</td><td>{html.escape(d['project_title'])}</td><td>{close_button(d)} {del_action}</td></tr>")
+        table=''.join(decision_rows) or "<tr><td colspan='5'>No decisions found.</td></tr>"
+        uopts=''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}'>{html.escape(p['title'])}</option>" for p in projects])
+        body = f"<div class='card'><table><tr><th>Decision</th><th>Status</th><th>Owner</th><th>Project</th><th>Actions</th></tr>{table}</table></div><div class='card'><h3>New decision</h3><form method='POST' class='grid'><input name='title' required><select name='project_id'><option value=''>Org-level</option>{popts}</select><select name='decision_type'><option>STRATEGIC</option><option>FINANCIAL</option><option>OPERATIONAL</option><option>GOVERNANCE</option></select><select name='status'><option>PROPOSED</option><option>REVISIT</option></select><select name='owner_user_id'>{uopts}</select><input name='approver'><input type='date' name='due_date'><select name='impact_level'><option>LOW</option><option>MED</option><option>HIGH</option></select><textarea name='rationale'></textarea><textarea name='options_considered'></textarea><button>Create</button></form></div>"
+        return respond(start_response, layout(user, "Decisions", body, toast_message(environ)))
 
-    if path.startswith("/decisions/") and path.endswith("/status") and method == "POST":
-        did = int(path.split("/")[2])
-        form = parse_form(environ)
-        target = safe_choice(form.get("status", ""), DECISION_STATUS, "PROPOSED")
+    if path.startswith('/decisions/') and path.endswith('/status') and method == 'POST':
+        did = int(path.split('/')[2]); form=parse_form(environ)
         with get_conn() as conn:
-            row = conn.execute("SELECT * FROM decisions WHERE id=?", (did,)).fetchone()
-            if not row:
-                return respond(start_response, layout(user, "Not found", "<div class='card'>Decision not found.</div>"), "404 Not Found")
-            if not can_edit_owned_or_admin(user, row["owner_user_id"]):
-                return respond(start_response, layout(user, "Forbidden", "<div class='card'>You cannot edit this decision.</div>"), "403 Forbidden")
-            ok, msg = validate_decision_transition(row["status"], target, form.get("decision_outcome", ""), form.get("decision_date"))
+            d=conn.execute("SELECT * FROM decisions WHERE id=? AND deleted_at IS NULL", (did,)).fetchone()
+            if not d or not can_edit_owned_or_admin(user,d['owner_user_id']):
+                return respond(start_response, layout(user, "Forbidden", "<div class='card'>Not allowed.</div>"), "403 Forbidden")
+            ok,msg = validate_decision_transition(d['status'], form.get('status',''), form.get('decision_outcome',''), form.get('decision_date'))
             if not ok:
-                return respond(start_response, layout(user, "Invalid transition", f"<div class='card'>{html.escape(msg)}</div>"), "400 Bad Request")
-            conn.execute("UPDATE decisions SET status=?, decision_outcome=?, decision_date=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (target, form.get("decision_outcome") or row["decision_outcome"], form.get("decision_date") or row["decision_date"], did))
-            conn.execute("INSERT INTO activity_logs(entity_type,entity_id,action,actor_user_id) VALUES('DECISION',?,?,?)", (did, f"STATUS_{target}", user.id))
-        return redirect(start_response, "/decisions")
+                return respond(start_response, layout(user, "Invalid", f"<div class='card'>{html.escape(msg)}</div>"), "400 Bad Request")
+            conn.execute("UPDATE decisions SET status=?,decision_date=?,decision_outcome=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (form.get('status'), form.get('decision_date') or d['decision_date'], form.get('decision_outcome') or d['decision_outcome'], did))
+        return redirect(start_response, "/decisions?toast=Decision%20marked%20as%20DECIDED")
 
-    if path == "/actions":
-        if method == "POST":
-            form = parse_form(environ)
-            owner = int(form.get("owner_user_id", user.id))
-            if user.role == "MEMBER":
-                owner = user.id
+    if path.startswith('/decisions/') and path.endswith('/delete') and method == 'POST':
+        did = int(path.split('/')[2])
+        with get_conn() as conn:
+            d = conn.execute("SELECT owner_user_id FROM decisions WHERE id=? AND deleted_at IS NULL", (did,)).fetchone()
+            if not d or not can_delete(user, d['owner_user_id']):
+                return respond(start_response, layout(user, "Forbidden", "<div class='card'>Not allowed.</div>"), "403 Forbidden")
+            conn.execute("UPDATE decisions SET deleted_at=CURRENT_TIMESTAMP WHERE id=?", (did,))
+            conn.execute("UPDATE action_items SET deleted_at=CURRENT_TIMESTAMP WHERE decision_id=?", (did,))
+        return redirect(start_response, "/decisions?toast=Decision%20deleted")
+
+    if path == '/actions':
+        if method == 'POST':
+            form=parse_form(environ)
+            owner=user.id if user.role=='MEMBER' else int(form.get('owner_user_id',user.id))
             with get_conn() as conn:
-                conn.execute("INSERT INTO action_items(project_id,decision_id,title,owner_user_id,status,due_date,notes) VALUES(?,?,?,?,?,?,?)", (
-                    form.get("project_id") or None,
-                    form.get("decision_id") or None,
-                    form.get("title", "").strip(),
-                    owner,
-                    safe_choice(form.get("status", "OPEN"), ACTION_STATUS, "OPEN"),
-                    form.get("due_date") or None,
-                    form.get("notes", ""),
-                ))
-
+                conn.execute("INSERT INTO action_items(project_id,decision_id,title,owner_user_id,status,due_date,notes) VALUES(?,?,?,?,?,?,?)", (form.get('project_id') or None, form.get('decision_id') or None, form.get('title',''), owner, safe_choice(form.get('status','OPEN'),ACTION_STATUS,'OPEN'), form.get('due_date') or None, form.get('notes','')))
         with get_conn() as conn:
-            rows = conn.execute("SELECT a.*,u.name owner_name,p.title project_title FROM action_items a JOIN users u ON u.id=a.owner_user_id LEFT JOIN projects p ON p.id=a.project_id ORDER BY a.status,a.due_date").fetchall()
-            users = conn.execute("SELECT id,name FROM users ORDER BY name").fetchall()
-            projects = conn.execute("SELECT id,title FROM projects ORDER BY title").fetchall()
-            decisions = conn.execute("SELECT id,title FROM decisions ORDER BY title").fetchall()
-        if user.role == "MEMBER":
-            rows = [r for r in rows if r["owner_user_id"] == user.id]
+            rows=conn.execute("SELECT a.*,u.name owner_name,COALESCE(p.title,'-') project_title FROM action_items a JOIN users u ON u.id=a.owner_user_id LEFT JOIN projects p ON p.id=a.project_id WHERE a.deleted_at IS NULL ORDER BY a.status,a.due_date").fetchall(); users=conn.execute("SELECT id,name FROM users WHERE is_active=1").fetchall(); projects=conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL").fetchall(); decisions=conn.execute("SELECT id,title FROM decisions WHERE deleted_at IS NULL").fetchall()
+        if user.role=='MEMBER': rows=[r for r in rows if r['owner_user_id']==user.id]
+        action_rows=[]
+        for r in rows:
+            del_action = row_action_delete(f"/actions/{r['id']}/delete") if can_delete(user, r['owner_user_id']) else '-'
+            action_rows.append(f"<tr><td>{html.escape(r['title'])}</td><td>{r['status']}</td><td>{html.escape(r['owner_name'])}</td><td>{r['due_date'] or '-'}</td><td>{html.escape(r['project_title'])}</td><td>{del_action}</td></tr>")
+        table=''.join(action_rows) or "<tr><td colspan='6'>No action items found.</td></tr>"
+        uopts=''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}'>{html.escape(p['title'])}</option>" for p in projects]); dopts=''.join([f"<option value='{d['id']}'>{html.escape(d['title'])}</option>" for d in decisions])
+        body=f"<div class='card'><table><tr><th>Title</th><th>Status</th><th>Owner</th><th>Due</th><th>Project</th><th>Actions</th></tr>{table}</table></div><div class='card'><h3>New action</h3><form method='POST' class='grid'><input name='title' required><select name='owner_user_id'>{uopts}</select><select name='project_id'><option value=''>None</option>{popts}</select><select name='decision_id'><option value=''>None</option>{dopts}</select><select name='status'><option>OPEN</option><option>IN_PROGRESS</option><option>DONE</option><option>CANCELLED</option></select><input type='date' name='due_date'><textarea name='notes'></textarea><button>Create</button></form></div>"
+        return respond(start_response, layout(user,'Action Items',body,toast_message(environ)))
 
-        table = ''.join([f"<tr><td>{html.escape(r['title'])}</td><td>{r['status']}</td><td>{html.escape(r['owner_name'])}</td><td>{r['due_date'] or '-'}</td><td>{html.escape(r['project_title'] or '-')}</td></tr>" for r in rows])
-        user_opts = ''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users])
-        project_opts = ''.join([f"<option value='{p['id']}'>{html.escape(p['title'])}</option>" for p in projects])
-        decision_opts = ''.join([f"<option value='{d['id']}'>{html.escape(d['title'])}</option>" for d in decisions])
-        body = f"<div class='card'><h3>Action items</h3><table><tr><th>Title</th><th>Status</th><th>Owner</th><th>Due</th><th>Project</th></tr>{table}</table></div>"
-        body += f"<div class='card'><h3>New action item</h3><form method='POST' class='grid'><input name='title' required placeholder='Action title'><select name='owner_user_id'>{user_opts}</select><select name='project_id'><option value=''>None</option>{project_opts}</select><select name='decision_id'><option value=''>None</option>{decision_opts}</select><select name='status'><option>OPEN</option><option>IN_PROGRESS</option><option>DONE</option><option>CANCELLED</option></select><input type='date' name='due_date'><textarea name='notes' placeholder='Notes'></textarea><button>Create action</button></form></div>"
-        return respond(start_response, layout(user, "Action Items", body))
+    if path.startswith('/actions/') and path.endswith('/delete') and method=='POST':
+        aid=int(path.split('/')[2])
+        with get_conn() as conn:
+            a=conn.execute("SELECT owner_user_id FROM action_items WHERE id=? AND deleted_at IS NULL", (aid,)).fetchone()
+            if not a or not can_delete(user,a['owner_user_id']):
+                return respond(start_response, layout(user,'Forbidden',"<div class='card'>Not allowed.</div>"),'403 Forbidden')
+            conn.execute("UPDATE action_items SET deleted_at=CURRENT_TIMESTAMP WHERE id=?", (aid,))
+        return redirect(start_response, '/actions?toast=Action%20item%20deleted')
 
-    if path == "/risks":
-        if method == "POST":
-            form = parse_form(environ)
+    if path == '/risks':
+        if method=='POST':
+            form=parse_form(environ)
             with get_conn() as conn:
-                conn.execute("INSERT INTO risk_issues(project_id,type,title,description,probability,impact,status,owner_user_id,mitigation_plan,due_date) VALUES(?,?,?,?,?,?,?,?,?,?)", (
-                    int(form.get("project_id")),
-                    safe_choice(form.get("type", "RISK"), RISK_TYPES, "RISK"),
-                    form.get("title", "").strip(),
-                    form.get("description", ""),
-                    max(1, min(5, int(form.get("probability", "3")))),
-                    max(1, min(5, int(form.get("impact", "3")))),
-                    safe_choice(form.get("status", "OPEN"), RISK_STATUS, "OPEN"),
-                    int(form.get("owner_user_id", user.id)),
-                    form.get("mitigation_plan", ""),
-                    form.get("due_date") or None,
-                ))
-
+                conn.execute("INSERT INTO risk_issues(project_id,type,title,description,probability,impact,status,owner_user_id,mitigation_plan,due_date) VALUES(?,?,?,?,?,?,?,?,?,?)", (int(form.get('project_id')), safe_choice(form.get('type','RISK'),RISK_TYPES,'RISK'), form.get('title',''), form.get('description',''), max(1,min(5,int(form.get('probability','3')))), max(1,min(5,int(form.get('impact','3')))), safe_choice(form.get('status','OPEN'),RISK_STATUS,'OPEN'), int(form.get('owner_user_id',user.id)), form.get('mitigation_plan',''), form.get('due_date') or None))
         with get_conn() as conn:
-            rows = conn.execute("SELECT r.*,u.name owner_name,p.title project_title,(probability*impact) score FROM risk_issues r JOIN users u ON u.id=r.owner_user_id JOIN projects p ON p.id=r.project_id ORDER BY score DESC").fetchall()
-            users = conn.execute("SELECT id,name FROM users ORDER BY name").fetchall()
-            projects = conn.execute("SELECT id,title FROM projects ORDER BY title").fetchall()
+            rows=conn.execute("SELECT r.*,u.name owner_name,p.title project_title,(probability*impact) score FROM risk_issues r JOIN users u ON u.id=r.owner_user_id JOIN projects p ON p.id=r.project_id WHERE r.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY score DESC").fetchall(); users=conn.execute("SELECT id,name FROM users WHERE is_active=1").fetchall(); projects=conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL").fetchall()
+        risk_rows=[]
+        for r in rows:
+            del_action = row_action_delete(f"/risks/{r['id']}/delete") if can_delete(user, r['owner_user_id']) else '-'
+            risk_rows.append(f"<tr><td>{html.escape(r['title'])}</td><td>{r['type']}</td><td>{r['score']}</td><td>{r['status']}</td><td>{html.escape(r['project_title'])}</td><td>{del_action}</td></tr>")
+        table=''.join(risk_rows) or "<tr><td colspan='6'>No risks/issues found.</td></tr>"
+        uopts=''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}'>{html.escape(p['title'])}</option>" for p in projects])
+        body=f"<div class='card'><table><tr><th>Title</th><th>Type</th><th>Score</th><th>Status</th><th>Project</th><th>Actions</th></tr>{table}</table></div><div class='card'><h3>New risk/issue</h3><form method='POST' class='grid'><input name='title' required><select name='type'><option>RISK</option><option>ISSUE</option></select><select name='project_id'>{popts}</select><select name='owner_user_id'>{uopts}</select><input type='number' min='1' max='5' name='probability' value='3'><input type='number' min='1' max='5' name='impact' value='3'><input type='date' name='due_date'><select name='status'><option>OPEN</option><option>MITIGATED</option><option>CLOSED</option></select><textarea name='description'></textarea><textarea name='mitigation_plan'></textarea><button>Create</button></form></div>"
+        return respond(start_response, layout(user,'Risks & Issues',body,toast_message(environ)))
 
-        table = ''.join([f"<tr><td>{html.escape(r['title'])}</td><td>{r['type']}</td><td>{r['score']}</td><td>{r['status']}</td><td>{html.escape(r['project_title'])}</td></tr>" for r in rows])
-        user_opts = ''.join([f"<option value='{u['id']}'>{html.escape(u['name'])}</option>" for u in users])
-        project_opts = ''.join([f"<option value='{p['id']}'>{html.escape(p['title'])}</option>" for p in projects])
-        body = f"<div class='card'><h3>Risk & issue register</h3><table><tr><th>Title</th><th>Type</th><th>Score</th><th>Status</th><th>Project</th></tr>{table}</table></div>"
-        body += f"<div class='card'><h3>New risk/issue</h3><form method='POST' class='grid'><input name='title' required placeholder='Title'><select name='type'><option>RISK</option><option>ISSUE</option></select><select name='project_id'>{project_opts}</select><select name='owner_user_id'>{user_opts}</select><input type='number' min='1' max='5' name='probability' value='3'><input type='number' min='1' max='5' name='impact' value='3'><input type='date' name='due_date'><select name='status'><option>OPEN</option><option>MITIGATED</option><option>CLOSED</option></select><textarea name='description' placeholder='Description'></textarea><textarea name='mitigation_plan' placeholder='Mitigation plan'></textarea><button>Create risk/issue</button></form></div>"
-        return respond(start_response, layout(user, "Risks & Issues", body))
+    if path.startswith('/risks/') and path.endswith('/delete') and method=='POST':
+        rid=int(path.split('/')[2])
+        with get_conn() as conn:
+            r=conn.execute("SELECT owner_user_id FROM risk_issues WHERE id=? AND deleted_at IS NULL", (rid,)).fetchone()
+            if not r or not can_delete(user, r['owner_user_id']):
+                return respond(start_response, layout(user,'Forbidden',"<div class='card'>Not allowed.</div>"),'403 Forbidden')
+            conn.execute("UPDATE risk_issues SET deleted_at=CURRENT_TIMESTAMP WHERE id=?", (rid,))
+        return redirect(start_response, '/risks?toast=Risk%2FIssue%20deleted')
 
-    if path == "/stakeholders":
-        if method == "POST":
-            form = parse_form(environ)
+    if path == '/stakeholders':
+        if method=='POST':
+            form=parse_form(environ)
             with get_conn() as conn:
-                conn.execute("INSERT INTO stakeholders(name,title,org_unit,contact,influence_level,stance,notes) VALUES(?,?,?,?,?,?,?)", (
-                    form.get("name", "").strip(),
-                    form.get("title", ""),
-                    form.get("org_unit", ""),
-                    form.get("contact") or None,
-                    safe_choice(form.get("influence_level", "MED"), IMPACT_LEVELS, "MED"),
-                    safe_choice(form.get("stance", "NEUTRAL"), {"SUPPORTIVE", "NEUTRAL", "RESISTANT"}, "NEUTRAL"),
-                    form.get("notes", ""),
-                ))
+                conn.execute("INSERT INTO stakeholders(name,title,org_unit,contact,influence_level,stance,notes) VALUES(?,?,?,?,?,?,?)", (form.get('name',''), form.get('title',''), form.get('org_unit',''), form.get('contact') or None, safe_choice(form.get('influence_level','MED'),IMPACT_LEVELS,'MED'), safe_choice(form.get('stance','NEUTRAL'),STANCE,'NEUTRAL'), form.get('notes','')))
         with get_conn() as conn:
-            rows = conn.execute("SELECT * FROM stakeholders ORDER BY created_at DESC").fetchall()
-        table = ''.join([f"<tr><td>{html.escape(s['name'])}</td><td>{html.escape(s['title'])}</td><td>{html.escape(s['org_unit'])}</td><td>{s['influence_level']}</td><td>{s['stance']}</td></tr>" for s in rows])
-        body = f"<div class='card'><h3>Directory</h3><table><tr><th>Name</th><th>Title</th><th>Org Unit</th><th>Influence</th><th>Stance</th></tr>{table}</table></div>"
-        body += "<div class='card'><h3>New stakeholder</h3><form method='POST' class='grid'><input name='name' required placeholder='Name'><input name='title' placeholder='Title'><input name='org_unit' placeholder='Org unit'><input name='contact' placeholder='Contact'><select name='influence_level'><option>LOW</option><option selected>MED</option><option>HIGH</option></select><select name='stance'><option>SUPPORTIVE</option><option selected>NEUTRAL</option><option>RESISTANT</option></select><textarea name='notes' placeholder='Notes'></textarea><button>Create stakeholder</button></form></div>"
-        return respond(start_response, layout(user, "Stakeholders", body))
+            rows=conn.execute("SELECT * FROM stakeholders WHERE deleted_at IS NULL ORDER BY created_at DESC").fetchall()
+        stakeholder_rows=[]
+        for s in rows:
+            del_action = row_action_delete(f"/stakeholders/{s['id']}/delete") if user.role=='ADMIN' else '-'
+            stakeholder_rows.append(f"<tr><td>{html.escape(s['name'])}</td><td>{html.escape(s['title'])}</td><td>{html.escape(s['org_unit'])}</td><td>{s['influence_level']}</td><td>{s['stance']}</td><td>{del_action}</td></tr>")
+        table=''.join(stakeholder_rows) or "<tr><td colspan='6'>No stakeholders found.</td></tr>"
+        body=f"<div class='card'><table><tr><th>Name</th><th>Title</th><th>Org Unit</th><th>Influence</th><th>Stance</th><th>Actions</th></tr>{table}</table></div><div class='card'><h3>New stakeholder</h3><form method='POST' class='grid'><input name='name' required><input name='title'><input name='org_unit'><input name='contact'><select name='influence_level'><option>LOW</option><option>MED</option><option>HIGH</option></select><select name='stance'><option>SUPPORTIVE</option><option>NEUTRAL</option><option>RESISTANT</option></select><textarea name='notes'></textarea><button>Create</button></form></div>"
+        return respond(start_response, layout(user,'Stakeholders',body,toast_message(environ)))
 
-    if path == "/war-room":
+    if path.startswith('/stakeholders/') and path.endswith('/delete') and method=='POST':
+        sid=int(path.split('/')[2])
+        if user.role != 'ADMIN':
+            return respond(start_response, layout(user,'Forbidden',"<div class='card'>Admins only.</div>"),'403 Forbidden')
         with get_conn() as conn:
-            p0_p1 = conn.execute("SELECT title,status,short_description FROM projects WHERE priority IN ('P0','P1') ORDER BY priority,status").fetchall()
-            decisions = conn.execute("SELECT title,status,due_date FROM decisions WHERE status IN ('PROPOSED','REVISIT') ORDER BY due_date LIMIT 10").fetchall()
-            overdue = conn.execute("SELECT title,due_date FROM action_items WHERE status != 'DONE' AND due_date < date('now') ORDER BY due_date LIMIT 5").fetchall()
-            risks = conn.execute("SELECT title, probability*impact score FROM risk_issues ORDER BY score DESC LIMIT 5").fetchall()
+            conn.execute("UPDATE stakeholders SET deleted_at=CURRENT_TIMESTAMP WHERE id=?", (sid,))
+            conn.execute("UPDATE project_stakeholders SET deleted_at=CURRENT_TIMESTAMP WHERE stakeholder_id=?", (sid,))
+        return redirect(start_response, '/stakeholders?toast=Stakeholder%20deleted')
 
-        lines = ["WAR ROOM BRIEF", f"Week of {date.today()}", "", "P0/P1 Projects:"]
-        lines += [f"- {x['title']} [{x['status']}] blocker: {x['short_description']}" for x in p0_p1]
-        lines += ["", "Decisions needed this week:"] + [f"- {d['title']} ({d['status']}) due {d['due_date'] or 'n/a'}" for d in decisions]
-        lines += ["", "Top 5 overdue action items:"] + [f"- {a['title']} due {a['due_date']}" for a in overdue]
-        lines += ["", "Top 5 risks/issues:"] + [f"- {r['title']} score {r['score']}" for r in risks]
-        brief = "\n".join(lines)
-        body = f"<div class='card'><h3>Weekly executive summary</h3><textarea id='brief' rows='18'>{html.escape(brief)}</textarea><p><button onclick=\"navigator.clipboard.writeText(document.getElementById('brief').value);this.innerText='Copied!';\">Copy formatted brief</button></p></div>"
-        return respond(start_response, layout(user, "War Room Brief", body))
-
-    if path == "/search":
-        q = parse_qs(environ.get("QUERY_STRING", "")).get("q", [""])[0].strip()
-        like = f"%{q}%"
+    if path == '/search':
+        q=parse_qs(environ.get('QUERY_STRING','')).get('q',[''])[0]
+        like=f"%{q}%"
         with get_conn() as conn:
-            projects = conn.execute("SELECT title FROM projects WHERE title LIKE ? LIMIT 10", (like,)).fetchall()
-            decisions = conn.execute("SELECT title FROM decisions WHERE title LIKE ? LIMIT 10", (like,)).fetchall()
-            actions = conn.execute("SELECT title FROM action_items WHERE title LIKE ? LIMIT 10", (like,)).fetchall()
-        items = ''.join([f"<li>Project: {html.escape(r['title'])}</li>" for r in projects])
-        items += ''.join([f"<li>Decision: {html.escape(r['title'])}</li>" for r in decisions])
-        items += ''.join([f"<li>Action: {html.escape(r['title'])}</li>" for r in actions])
-        body = f"<div class='card'><h3>Search results</h3><p class='muted'>Query: {html.escape(q)}</p><ul>{items or '<li>No matches.</li>'}</ul></div>"
-        return respond(start_response, layout(user, "Search", body))
+            p=conn.execute("SELECT title FROM projects WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall(); d=conn.execute("SELECT title FROM decisions WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall(); a=conn.execute("SELECT title FROM action_items WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
+        items=''.join([f"<li>Project: {html.escape(x['title'])}</li>" for x in p])+''.join([f"<li>Decision: {html.escape(x['title'])}</li>" for x in d])+''.join([f"<li>Action: {html.escape(x['title'])}</li>" for x in a])
+        return respond(start_response, layout(user,'Search',f"<div class='card'><ul>{items or '<li>No matches.</li>'}</ul></div>"))
 
-    if path == "/admin/users":
+    if path == '/admin/users':
         if not can_manage_users(user):
-            return respond(start_response, layout(user, "Forbidden", "<div class='card'>Admins only.</div>"), "403 Forbidden")
-        if method == "POST":
+            return respond(start_response, layout(user,'Forbidden',"<div class='card'>Admins only.</div>"),'403 Forbidden')
+        if method == 'POST':
             form = parse_form(environ)
-            create_user(form.get("name", ""), form.get("email", ""), form.get("password", ""), form.get("role", "MEMBER"))
+            action = form.get('action')
+            with get_conn() as conn:
+                if action == 'create':
+                    create_user(form.get('name',''), form.get('email',''), form.get('temp_password',''), form.get('role','MEMBER'), must_change_password=True)
+                elif action == 'edit':
+                    uid = int(form['user_id'])
+                    if uid == user.id and form.get('role') != 'ADMIN':
+                        return respond(start_response, layout(user,'Invalid',"<div class='card'>You cannot demote yourself.</div>"), '400 Bad Request')
+                    if form.get('role') != 'ADMIN':
+                        admins = conn.execute("SELECT COUNT(*) c FROM users WHERE role='ADMIN' AND is_active=1").fetchone()['c']
+                        current = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+                        if current and current['role'] == 'ADMIN' and admins <= 1:
+                            return respond(start_response, layout(user,'Invalid',"<div class='card'>Cannot demote the last ADMIN.</div>"), '400 Bad Request')
+                    conn.execute("UPDATE users SET name=?, role=?, is_active=? WHERE id=?", (form.get('name',''), safe_choice(form.get('role','MEMBER'),{'ADMIN','EXEC','MEMBER'},'MEMBER'), 1 if form.get('is_active') == '1' else 0, uid))
+                elif action == 'reset_password':
+                    uid = int(form['user_id'])
+                    update_password(uid, form.get('temp_password',''), must_change_password=True)
+        q = parse_qs(environ.get('QUERY_STRING','')).get('q',[''])[0]
         with get_conn() as conn:
-            users = conn.execute("SELECT name,email,role,created_at FROM users ORDER BY created_at DESC").fetchall()
-        table = ''.join([f"<tr><td>{html.escape(u['name'])}</td><td>{html.escape(u['email'])}</td><td>{u['role']}</td><td>{u['created_at']}</td></tr>" for u in users])
-        body = f"<div class='card'><h3>Users</h3><table><tr><th>Name</th><th>Email</th><th>Role</th><th>Created</th></tr>{table}</table></div>"
-        body += "<div class='card'><h3>Create user</h3><form method='POST' class='grid'><input name='name' required><input name='email' type='email' required><input name='password' required><select name='role'><option>ADMIN</option><option>EXEC</option><option selected>MEMBER</option></select><button>Create user</button></form></div>"
-        return respond(start_response, layout(user, "User Administration", body))
+            users = conn.execute("SELECT * FROM users WHERE name LIKE ? OR email LIKE ? ORDER BY created_at DESC", (f"%{q}%", f"%{q}%")).fetchall()
+        rows=[]
+        for u in users:
+            edit = f"<form method='POST' class='grid'><input type='hidden' name='action' value='edit'><input type='hidden' name='user_id' value='{u['id']}'><input name='name' value='{html.escape(u['name'])}'><select name='role'><option {'selected' if u['role']=='ADMIN' else ''}>ADMIN</option><option {'selected' if u['role']=='EXEC' else ''}>EXEC</option><option {'selected' if u['role']=='MEMBER' else ''}>MEMBER</option></select><select name='is_active'><option value='1' {'selected' if u['is_active']==1 else ''}>active</option><option value='0' {'selected' if u['is_active']==0 else ''}>disabled</option></select><button>Save</button></form>"
+            reset = f"<form method='POST'><input type='hidden' name='action' value='reset_password'><input type='hidden' name='user_id' value='{u['id']}'><input name='temp_password' placeholder='New temp password' required><button>Reset password</button></form>"
+            rows.append(f"<tr><td>{html.escape(u['name'])}</td><td>{html.escape(u['email'])}</td><td>{u['role']}</td><td>{u['created_at']}</td><td>{edit}{reset}</td></tr>")
+        table=''.join(rows) or "<tr><td colspan='5'>No users found.</td></tr>"
+        body=f"<div class='card'><form method='GET'><input name='q' value='{html.escape(q)}' placeholder='Search name/email'><button>Search</button></form><table><tr><th>Name</th><th>Email</th><th>Role</th><th>Created</th><th>Manage</th></tr>{table}</table></div><div class='card'><h3>Create user</h3><form method='POST' class='grid'><input type='hidden' name='action' value='create'><input name='name' required><input type='email' name='email' required><select name='role'><option>ADMIN</option><option>EXEC</option><option>MEMBER</option></select><input name='temp_password' required placeholder='Temporary password'><button>Create user</button></form></div>"
+        return respond(start_response, layout(user,'User Administration',body,toast_message(environ)))
 
-    return respond(start_response, layout(user, "Not found", "<div class='card'>Route not found.</div>"), "404 Not Found")
+    return respond(start_response, layout(user, 'Not found', "<div class='card'>Route not found.</div>"), '404 Not Found')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     migrate()
-    print("Starting on http://localhost:8000")
-    with make_server("0.0.0.0", 8000, app) as server:
+    print('Starting on http://localhost:8000')
+    with make_server('0.0.0.0', 8000, app) as server:
         server.serve_forever()
