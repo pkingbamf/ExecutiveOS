@@ -182,6 +182,33 @@ def delete_action(entity: str, entity_id: int, typed: bool) -> str:
     return f"<form method='POST' action='/{entity}/{entity_id}/delete' onsubmit=\"return confirm('Delete this item?')\"><button class='btn btn-sm btn-danger'>Delete</button></form>"
 
 
+def can_view_owned_or_admin_exec(user, owner_user_id: int | None = None) -> bool:
+    if user.role in {"ADMIN", "EXEC"}:
+        return True
+    return owner_user_id is not None and user.id == owner_user_id
+
+
+def can_edit_entity(user, entity: str, owner_user_id: int | None) -> bool:
+    if user.role == "ADMIN":
+        return True
+    if user.role == "EXEC":
+        return owner_user_id is not None and user.id == owner_user_id
+    if user.role == "MEMBER":
+        return entity == "actions" and owner_user_id is not None and user.id == owner_user_id
+    return False
+
+
+def action_links(view_href: str, edit_href: str | None, delete_html: str = "", extra_html: str = "") -> str:
+    parts = [f"<a class='btn btn-sm btn-ghost' href='{view_href}'>View</a>"]
+    if edit_href:
+        parts.append(f"<a class='btn btn-sm' href='{edit_href}'>Edit</a>")
+    if extra_html:
+        parts.append(extra_html)
+    if delete_html:
+        parts.append(delete_html)
+    return "".join(parts)
+
+
 def app(environ, start_response):
     path = environ.get("PATH_INFO", "/")
     method = environ.get("REQUEST_METHOD", "GET")
@@ -281,7 +308,11 @@ def app(environ, start_response):
             users = conn.execute("SELECT id,name FROM users WHERE is_active=1 ORDER BY name").fetchall()
         if not can_view_all(user):
             rows = [r for r in rows if r["owner_user_id"] == user.id]
-        rows_html = "".join([f"<tr><td><a href='/projects/{r['id']}'>{e(r['title'])}</a></td><td>{render_badge(r['status'])}</td><td>{render_badge(r['priority'])}</td><td>{e(r['owner_name'])}</td><td class='actions'>{delete_action('projects', r['id'], True) if can_delete(user, r['owner_user_id']) else ''}</td></tr>" for r in rows])
+        project_rows = []
+        for r in rows:
+            links = action_links(f"/projects/{r['id']}", f"/projects/{r['id']}/edit" if can_edit_entity(user,'projects', r['owner_user_id']) else None, delete_action('projects', r['id'], True) if can_delete(user, r['owner_user_id']) else '')
+            project_rows.append(f"<tr><td><a href='/projects/{r['id']}'>{e(r['title'])}</a></td><td>{render_badge(r['status'])}</td><td>{render_badge(r['priority'])}</td><td>{e(r['owner_name'])}</td><td class='actions'>{links}</td></tr>")
+        rows_html = ''.join(project_rows)
         table = render_table(["Title", "Status", "Priority", "Owner", "Actions"], rows_html, "No projects found.")
         owner_opts = "".join([f"<option value='{u['id']}'>{e(u['name'])}</option>" for u in users])
         form = "<form method='POST' class='form-grid'>" \
@@ -293,6 +324,30 @@ def app(environ, start_response):
             "<div class='field'><label>Tags</label><input name='tags' placeholder='comma-separated'></div><div class='field'><label>&nbsp;</label><button class='btn'>Create project</button></div></form>"
         body = render_page_header("Projects", "Track strategic initiatives") + render_card("Project list", table) + render_card("New project", form)
         return respond(start_response, layout(user, "Projects", body, toast_message(environ), path))
+
+
+    if path.startswith("/projects/") and path.endswith("/edit"):
+        pid = int(path.split("/")[2])
+        with get_conn() as conn:
+            proj = conn.execute("SELECT * FROM projects WHERE id=? AND deleted_at IS NULL", (pid,)).fetchone()
+            users = conn.execute("SELECT id,name FROM users WHERE is_active=1 ORDER BY name").fetchall()
+        if not proj:
+            return respond(start_response, layout(user, "Not found", render_card("Missing", "Project not found."), active_path=path), "404 Not Found")
+        if not can_edit_entity(user, 'projects', proj['owner_user_id']):
+            return respond(start_response, layout(user, "Forbidden", render_card("Not allowed", ""), active_path=path), "403 Forbidden")
+        if method == 'POST':
+            f = parse_form(environ)
+            owner = proj['owner_user_id'] if user.role == 'MEMBER' else int(f.get('owner_user_id', proj['owner_user_id']))
+            with get_conn() as conn:
+                conn.execute("UPDATE projects SET title=?,short_description=?,status=?,priority=?,owner_user_id=?,sponsor_name=?,start_date=?,target_date=?,tags=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (
+                    f.get('title',''), f.get('short_description',''), safe_choice(f.get('status','NOT_STARTED'), PROJECT_STATUS, 'NOT_STARTED'), safe_choice(f.get('priority','P2'), PROJECT_PRIORITY, 'P2'), owner, f.get('sponsor_name',''), f.get('start_date') or None, f.get('target_date') or None, json.dumps([t.strip() for t in f.get('tags','').split(',') if t.strip()]), pid
+                ))
+            return redirect(start_response, f"/projects/{pid}?toast=Saved")
+        owner_opts=''.join([f"<option value='{u['id']}' {'selected' if u['id']==proj['owner_user_id'] else ''}>{e(u['name'])}</option>" for u in users])
+        tags = ', '.join(json.loads(proj['tags'] or '[]')) if proj['tags'] else ''
+        form=f"<form method='POST' class='form-grid'><div class='field'><label>Title</label><input name='title' value='{e(proj['title'])}' required></div><div class='field'><label>Short description</label><input name='short_description' value='{e(proj['short_description'])}'></div><div class='field'><label>Status</label><select name='status'>" + ''.join([f"<option {'selected' if proj['status']==x else ''}>{x}</option>" for x in ['NOT_STARTED','IN_PROGRESS','AT_RISK','BLOCKED','DONE']]) + "</select></div><div class='field'><label>Priority</label><select name='priority'>" + ''.join([f"<option {'selected' if proj['priority']==x else ''}>{x}</option>" for x in ['P0','P1','P2','P3']]) + f"</select></div><div class='field'><label>Owner</label><select name='owner_user_id'>{owner_opts}</select></div><div class='field'><label>Sponsor</label><input name='sponsor_name' value='{e(proj['sponsor_name'])}'></div><div class='field'><label>Start date</label><input type='date' name='start_date' value='{e(proj['start_date'])}'></div><div class='field'><label>Target date</label><input type='date' name='target_date' value='{e(proj['target_date'])}'></div><div class='field'><label>Tags</label><input name='tags' value='{e(tags)}'></div><div class='field'><label>&nbsp;</label><button class='btn'>Save</button></div></form>"
+        body = render_page_header(f"Edit Project: {proj['title']}", "Update project record", f"/projects/{pid}") + render_card("Edit project", form)
+        return respond(start_response, layout(user, "Edit Project", body, active_path='/projects'))
 
     if path.startswith("/projects/") and path.endswith("/delete"):
         if parse_qs(environ.get("QUERY_STRING", "")).get("confirmed", [""])[0] != "1":
@@ -317,9 +372,9 @@ def app(environ, start_response):
                 return respond(start_response, layout(user, "Not found", render_card("Missing", "This item was deleted or not found."), active_path=path), "404 Not Found")
             if not can_view_all(user) and p["owner_user_id"] != user.id:
                 return respond(start_response, layout(user, "Forbidden", render_card("Forbidden", ""), active_path=path), "403 Forbidden")
-            decisions = conn.execute("SELECT title,status FROM decisions WHERE project_id=? AND deleted_at IS NULL", (pid,)).fetchall()
-            actions = conn.execute("SELECT title,status,due_date FROM action_items WHERE project_id=? AND deleted_at IS NULL", (pid,)).fetchall()
-            risks = conn.execute("SELECT title,probability*impact score,status FROM risk_issues WHERE project_id=? AND deleted_at IS NULL ORDER BY score DESC", (pid,)).fetchall()
+            decisions = conn.execute("SELECT id,title,status FROM decisions WHERE project_id=? AND deleted_at IS NULL", (pid,)).fetchall()
+            actions = conn.execute("SELECT id,title,status,due_date FROM action_items WHERE project_id=? AND deleted_at IS NULL", (pid,)).fetchall()
+            risks = conn.execute("SELECT id,title,probability*impact score,status FROM risk_issues WHERE project_id=? AND deleted_at IS NULL ORDER BY score DESC", (pid,)).fetchall()
         meta = f"{render_badge(p['status'])} {render_badge(p['priority'])} {render_badge('Owner: '+p['owner_name'],'muted')}"
         actions_html = delete_action("projects", pid, True) if can_delete(user, p["owner_user_id"]) else ""
         body = render_page_header(f"Project: {p['title']}", "Project details and linked execution", "/projects")
@@ -347,13 +402,58 @@ def app(environ, start_response):
             if can_edit_owned_or_admin(user, d["owner_user_id"]):
                 close = f"<form method='POST' action='/decisions/{d['id']}/status' onsubmit=\"var o=prompt('Decision outcome (required)');if(!o)return false;var dt=prompt('Decision date YYYY-MM-DD','{date.today()}');if(!dt)return false;this.decision_outcome.value=o;this.decision_date.value=dt;return true;\"><input type='hidden' name='status' value='DECIDED'><input type='hidden' name='decision_outcome'><input type='hidden' name='decision_date'><button class='btn btn-sm'>Mark DECIDED</button></form>"
             ddel = delete_action("decisions", d["id"], True) if can_delete(user, d["owner_user_id"]) else ""
-            decision_rows.append(f"<tr><td>{e(d['title'])}</td><td>{render_badge(d['status'])}</td><td>{e(d['owner_name'])}</td><td>{render_badge(d['project_title'],'muted')}</td><td class='actions'>{close}{ddel}</td></tr>")
+            links = action_links(f"/decisions/{d['id']}", f"/decisions/{d['id']}/edit" if can_edit_entity(user,'decisions', d['owner_user_id']) else None, ddel, close)
+            decision_rows.append(f"<tr><td><a href='/decisions/{d['id']}'>{e(d['title'])}</a></td><td>{render_badge(d['status'])}</td><td>{e(d['owner_name'])}</td><td>{render_badge(d['project_title'],'muted')}</td><td class='actions'>{links}</td></tr>")
         table = render_table(["Decision", "Status", "Owner", "Project", "Actions"], "".join(decision_rows), "No decisions found.")
         uopts = "".join([f"<option value='{u['id']}'>{e(u['name'])}</option>" for u in users])
         popts = "".join([f"<option value='{p['id']}'>{e(p['title'])}</option>" for p in projects])
         form = f"<form method='POST' class='form-grid'><div class='field'><label>Decision statement</label><input name='title' required></div><div class='field'><label>Project</label><select name='project_id'><option value=''>Org-level</option>{popts}</select></div><div class='field'><label>Type</label><select name='decision_type'><option>STRATEGIC</option><option>FINANCIAL</option><option>OPERATIONAL</option><option>GOVERNANCE</option></select></div><div class='field'><label>Status</label><select name='status'><option>PROPOSED</option><option>REVISIT</option></select></div><div class='field'><label>Owner</label><select name='owner_user_id'>{uopts}</select></div><div class='field'><label>Approver</label><input name='approver'></div><div class='field'><label>Due date</label><input type='date' name='due_date'></div><div class='field'><label>Impact level</label><select name='impact_level'><option>LOW</option><option>MED</option><option>HIGH</option></select></div><div class='field'><label>Rationale</label><textarea name='rationale'></textarea></div><div class='field'><label>Options considered</label><textarea name='options_considered'></textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Create decision</button></div></form>"
         body = render_page_header("Decisions", "Track executive decision lifecycle") + render_card("Decision register", table) + render_card("New decision", form)
         return respond(start_response, layout(user, "Decisions", body, toast_message(environ), path))
+
+
+    if path.startswith('/decisions/') and path.endswith('/edit'):
+        did = int(path.split('/')[2])
+        with get_conn() as conn:
+            d = conn.execute("SELECT * FROM decisions WHERE id=? AND deleted_at IS NULL", (did,)).fetchone()
+            users = conn.execute("SELECT id,name FROM users WHERE is_active=1 ORDER BY name").fetchall()
+            projects = conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL ORDER BY title").fetchall()
+        if not d:
+            return respond(start_response, layout(user, 'Not found', render_card('Missing', 'Decision not found.'), active_path=path), '404 Not Found')
+        if not can_edit_entity(user, 'decisions', d['owner_user_id']):
+            return respond(start_response, layout(user, 'Forbidden', render_card('Not allowed', ''), active_path=path), '403 Forbidden')
+        if method == 'POST':
+            f = parse_form(environ)
+            owner = d['owner_user_id'] if user.role == 'MEMBER' else int(f.get('owner_user_id', d['owner_user_id']))
+            with get_conn() as conn:
+                conn.execute("UPDATE decisions SET project_id=?,title=?,decision_type=?,owner_user_id=?,approver=?,rationale=?,options_considered=?,due_date=?,impact_level=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (
+                    f.get('project_id') or None, f.get('title',''), safe_choice(f.get('decision_type','STRATEGIC'), DECISION_TYPES,'STRATEGIC'), owner, f.get('approver',''), f.get('rationale',''), f.get('options_considered',''), f.get('due_date') or None, safe_choice(f.get('impact_level','MED'), IMPACT_LEVELS,'MED'), did
+                ))
+            return redirect(start_response, f"/decisions/{did}?toast=Saved")
+        uopts=''.join([f"<option value='{u['id']}' {'selected' if u['id']==d['owner_user_id'] else ''}>{e(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}' {'selected' if d['project_id']==p['id'] else ''}>{e(p['title'])}</option>" for p in projects])
+        ro = "<p><b>Decision outcome:</b> " + e(d['decision_outcome']) + "</p><p><b>Decision date:</b> " + e(d['decision_date']) + "</p>" if d['status']=='DECIDED' and user.role!='ADMIN' else ''
+        form=f"<form method='POST' class='form-grid'><div class='field'><label>Project</label><select name='project_id'><option value=''>Org-level</option>{popts}</select></div><div class='field'><label>Title</label><input name='title' value='{e(d['title'])}' required></div><div class='field'><label>Type</label><select name='decision_type'>" + ''.join([f"<option {'selected' if d['decision_type']==x else ''}>{x}</option>" for x in ['STRATEGIC','FINANCIAL','OPERATIONAL','GOVERNANCE']]) + f"</select></div><div class='field'><label>Owner</label><select name='owner_user_id'>{uopts}</select></div><div class='field'><label>Approver</label><input name='approver' value='{e(d['approver'])}'></div><div class='field'><label>Due date</label><input type='date' name='due_date' value='{e(d['due_date'])}'></div><div class='field'><label>Impact</label><select name='impact_level'>" + ''.join([f"<option {'selected' if d['impact_level']==x else ''}>{x}</option>" for x in ['LOW','MED','HIGH']]) + f"</select></div><div class='field'><label>Rationale</label><textarea name='rationale'>{e(d['rationale'])}</textarea></div><div class='field'><label>Options considered</label><textarea name='options_considered'>{e(d['options_considered'])}</textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Save</button></div></form>" + ro
+        body = render_page_header(f"Edit Decision: {d['title']}", "Update decision record", f"/decisions/{did}") + render_card('Edit decision', form)
+        return respond(start_response, layout(user, 'Edit Decision', body, active_path='/decisions'))
+
+    if path.startswith('/decisions/') and method == 'GET' and path.count('/') == 2:
+        did = int(path.split('/')[2])
+        with get_conn() as conn:
+            d = conn.execute("SELECT d.*,u.name owner_name,COALESCE(p.title,'Org-level') project_title FROM decisions d JOIN users u ON u.id=d.owner_user_id LEFT JOIN projects p ON p.id=d.project_id WHERE d.id=? AND d.deleted_at IS NULL", (did,)).fetchone()
+            linked_actions = conn.execute("SELECT id,title,status,due_date FROM action_items WHERE decision_id=? AND deleted_at IS NULL", (did,)).fetchall()
+        if not d:
+            return respond(start_response, layout(user, 'Not found', render_card('Missing', 'Decision not found.'), active_path=path), '404 Not Found')
+        if not can_view_owned_or_admin_exec(user, d['owner_user_id']):
+            return respond(start_response, layout(user, 'Forbidden', render_card('Not allowed', ''), active_path=path), '403 Forbidden')
+        actions = ''
+        if can_edit_entity(user, 'decisions', d['owner_user_id']):
+            actions += f"<a class='btn btn-sm' href='/decisions/{did}/edit'>Edit</a>"
+        if can_delete(user, d['owner_user_id']):
+            actions += delete_action('decisions', did, True)
+        body = render_page_header(f"Decision: {d['title']}", 'Decision detail', '/decisions')
+        body += render_card('Summary', f"<p>{render_badge(d['status'])} {render_badge(d['decision_type'])} {render_badge(d['project_title'],'muted')}</p><p><b>Owner:</b> {e(d['owner_name'])}</p><p><b>Approver:</b> {e(d['approver'])}</p><p><b>Rationale:</b> {e(d['rationale'])}</p><p><b>Options:</b> {e(d['options_considered'])}</p><p><b>Outcome:</b> {e(d['decision_outcome'])}</p><p><b>Decision date:</b> {e(d['decision_date'])}</p>", actions)
+        body += render_card('Linked action items', '<ul>' + (''.join([f"<li><a href='/actions/{a['id']}'>{e(a['title'])}</a> {render_badge(a['status'])} due {e(a['due_date'])}</li>" for a in linked_actions]) or "<li class='empty'>No linked actions.</li>") + '</ul>')
+        return respond(start_response, layout(user, 'Decision Detail', body, toast_message(environ), '/decisions'))
 
     if path.startswith('/decisions/') and path.endswith('/status') and method == 'POST':
         did = int(path.split('/')[2]); f = parse_form(environ)
@@ -389,12 +489,49 @@ def app(environ, start_response):
             rows = conn.execute("SELECT a.*,u.name owner_name,COALESCE(p.title,'-') project_title FROM action_items a JOIN users u ON u.id=a.owner_user_id LEFT JOIN projects p ON p.id=a.project_id WHERE a.deleted_at IS NULL ORDER BY a.status,a.due_date").fetchall()
             users = conn.execute("SELECT id,name FROM users WHERE is_active=1").fetchall(); projects = conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL").fetchall(); decisions = conn.execute("SELECT id,title FROM decisions WHERE deleted_at IS NULL").fetchall()
         if user.role == 'MEMBER': rows = [r for r in rows if r['owner_user_id'] == user.id]
-        rows_html = "".join([f"<tr><td>{e(r['title'])}</td><td>{render_badge(r['status'])}</td><td>{e(r['owner_name'])}</td><td>{e(r['due_date'])}</td><td>{e(r['project_title'])}</td><td class='actions'>{delete_action('actions', r['id'], False) if can_delete(user, r['owner_user_id']) else ''}</td></tr>" for r in rows])
+        action_rows = []
+        for r in rows:
+            links = action_links(f"/actions/{r['id']}", f"/actions/{r['id']}/edit" if can_edit_entity(user,'actions', r['owner_user_id']) else None, delete_action('actions', r['id'], False) if can_delete(user, r['owner_user_id']) else '')
+            action_rows.append(f"<tr><td><a href='/actions/{r['id']}'>{e(r['title'])}</a></td><td>{render_badge(r['status'])}</td><td>{e(r['owner_name'])}</td><td>{e(r['due_date'])}</td><td>{e(r['project_title'])}</td><td class='actions'>{links}</td></tr>")
+        rows_html = ''.join(action_rows)
         table = render_table(["Title", "Status", "Owner", "Due", "Project", "Actions"], rows_html, "No action items found.")
         uopts=''.join([f"<option value='{u['id']}'>{e(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}'>{e(p['title'])}</option>" for p in projects]); dopts=''.join([f"<option value='{d['id']}'>{e(d['title'])}</option>" for d in decisions])
         form = f"<form method='POST' class='form-grid'><div class='field'><label>Title</label><input name='title' required></div><div class='field'><label>Owner</label><select name='owner_user_id'>{uopts}</select></div><div class='field'><label>Project</label><select name='project_id'><option value=''>None</option>{popts}</select></div><div class='field'><label>Decision</label><select name='decision_id'><option value=''>None</option>{dopts}</select></div><div class='field'><label>Status</label><select name='status'><option>OPEN</option><option>IN_PROGRESS</option><option>DONE</option><option>CANCELLED</option></select></div><div class='field'><label>Due date</label><input type='date' name='due_date'></div><div class='field'><label>Notes</label><textarea name='notes'></textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Create action</button></div></form>"
         body = render_page_header("Action Items", "Operational execution queue") + render_card("Action list", table) + render_card("New action item", form)
         return respond(start_response, layout(user, 'Action Items', body, toast_message(environ), path))
+
+
+    if path.startswith('/actions/') and path.endswith('/edit'):
+        aid = int(path.split('/')[2])
+        with get_conn() as conn:
+            a = conn.execute("SELECT * FROM action_items WHERE id=? AND deleted_at IS NULL", (aid,)).fetchone()
+            users = conn.execute("SELECT id,name FROM users WHERE is_active=1 ORDER BY name").fetchall(); projects = conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL ORDER BY title").fetchall(); decisions = conn.execute("SELECT id,title FROM decisions WHERE deleted_at IS NULL ORDER BY title").fetchall()
+        if not a:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','Action not found.'),active_path=path),'404 Not Found')
+        if not can_edit_entity(user,'actions', a['owner_user_id']):
+            return respond(start_response, layout(user,'Forbidden',render_card('Not allowed',''),active_path=path),'403 Forbidden')
+        if method == 'POST':
+            f=parse_form(environ)
+            owner = a['owner_user_id'] if user.role=='MEMBER' else int(f.get('owner_user_id', a['owner_user_id']))
+            with get_conn() as conn:
+                conn.execute("UPDATE action_items SET project_id=?,decision_id=?,title=?,owner_user_id=?,status=?,due_date=?,notes=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (f.get('project_id') or None, f.get('decision_id') or None, f.get('title',''), owner, safe_choice(f.get('status','OPEN'), ACTION_STATUS,'OPEN'), f.get('due_date') or None, f.get('notes',''), aid))
+            return redirect(start_response, f"/actions/{aid}?toast=Saved")
+        uopts=''.join([f"<option value='{u['id']}' {'selected' if u['id']==a['owner_user_id'] else ''}>{e(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}' {'selected' if a['project_id']==p['id'] else ''}>{e(p['title'])}</option>" for p in projects]); dopts=''.join([f"<option value='{d['id']}' {'selected' if a['decision_id']==d['id'] else ''}>{e(d['title'])}</option>" for d in decisions])
+        form=f"<form method='POST' class='form-grid'><div class='field'><label>Title</label><input name='title' value='{e(a['title'])}' required></div><div class='field'><label>Owner</label><select name='owner_user_id'>{uopts}</select></div><div class='field'><label>Project</label><select name='project_id'><option value=''>None</option>{popts}</select></div><div class='field'><label>Decision</label><select name='decision_id'><option value=''>None</option>{dopts}</select></div><div class='field'><label>Status</label><select name='status'>" + ''.join([f"<option {'selected' if a['status']==x else ''}>{x}</option>" for x in ['OPEN','IN_PROGRESS','DONE','CANCELLED']]) + f"</select></div><div class='field'><label>Due date</label><input type='date' name='due_date' value='{e(a['due_date'])}'></div><div class='field'><label>Notes</label><textarea name='notes'>{e(a['notes'])}</textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Save</button></div></form>"
+        body = render_page_header(f"Edit Action: {a['title']}", 'Update action item', f"/actions/{aid}") + render_card('Edit action', form)
+        return respond(start_response, layout(user,'Edit Action',body,active_path='/actions'))
+
+    if path.startswith('/actions/') and method == 'GET' and path.count('/') == 2:
+        aid = int(path.split('/')[2])
+        with get_conn() as conn:
+            a = conn.execute("SELECT a.*,u.name owner_name,COALESCE(p.title,'-') project_title,COALESCE(d.title,'-') decision_title FROM action_items a JOIN users u ON u.id=a.owner_user_id LEFT JOIN projects p ON p.id=a.project_id LEFT JOIN decisions d ON d.id=a.decision_id WHERE a.id=? AND a.deleted_at IS NULL", (aid,)).fetchone()
+        if not a:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','Action not found.'),active_path=path),'404 Not Found')
+        if not can_view_owned_or_admin_exec(user, a['owner_user_id']):
+            return respond(start_response, layout(user,'Forbidden',render_card('Not allowed',''),active_path=path),'403 Forbidden')
+        actions = (f"<a class='btn btn-sm' href='/actions/{aid}/edit'>Edit</a>" if can_edit_entity(user,'actions',a['owner_user_id']) else '') + (delete_action('actions', aid, False) if can_delete(user,a['owner_user_id']) else '')
+        body = render_page_header(f"Action: {a['title']}", 'Action item details', '/actions') + render_card('Summary', f"<p>{render_badge(a['status'])}</p><p><b>Owner:</b> {e(a['owner_name'])}</p><p><b>Project:</b> {e(a['project_title'])}</p><p><b>Decision:</b> {e(a['decision_title'])}</p><p><b>Due:</b> {e(a['due_date'])}</p><p><b>Notes:</b> {e(a['notes'])}</p>", actions)
+        return respond(start_response, layout(user,'Action Detail',body,toast_message(environ),'/actions'))
 
     if path.startswith('/actions/') and path.endswith('/delete') and method == 'POST':
         aid = int(path.split('/')[2])
@@ -412,12 +549,49 @@ def app(environ, start_response):
                 conn.execute("INSERT INTO risk_issues(project_id,type,title,description,probability,impact,status,owner_user_id,mitigation_plan,due_date) VALUES(?,?,?,?,?,?,?,?,?,?)", (int(f.get('project_id')), safe_choice(f.get('type', 'RISK'), RISK_TYPES, 'RISK'), f.get('title', ''), f.get('description', ''), max(1, min(5, int(f.get('probability', '3')))), max(1, min(5, int(f.get('impact', '3')))), safe_choice(f.get('status', 'OPEN'), RISK_STATUS, 'OPEN'), int(f.get('owner_user_id', user.id)), f.get('mitigation_plan', ''), f.get('due_date') or None))
         with get_conn() as conn:
             rows = conn.execute("SELECT r.*,u.name owner_name,p.title project_title,(probability*impact) score FROM risk_issues r JOIN users u ON u.id=r.owner_user_id JOIN projects p ON p.id=r.project_id WHERE r.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY score DESC").fetchall(); users = conn.execute("SELECT id,name FROM users WHERE is_active=1").fetchall(); projects = conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL").fetchall()
-        rows_html = "".join([f"<tr><td>{e(r['title'])}</td><td>{render_badge(r['type'])}</td><td>{r['score']}</td><td>{render_badge(r['status'])}</td><td>{e(r['project_title'])}</td><td class='actions'>{delete_action('risks', r['id'], False) if can_delete(user, r['owner_user_id']) else ''}</td></tr>" for r in rows])
+        risk_rows = []
+        for r in rows:
+            links = action_links(f"/risks/{r['id']}", f"/risks/{r['id']}/edit" if can_edit_entity(user,'risks', r['owner_user_id']) else None, delete_action('risks', r['id'], False) if can_delete(user, r['owner_user_id']) else '')
+            risk_rows.append(f"<tr><td><a href='/risks/{r['id']}'>{e(r['title'])}</a></td><td>{render_badge(r['type'])}</td><td>{r['score']}</td><td>{render_badge(r['status'])}</td><td>{e(r['project_title'])}</td><td class='actions'>{links}</td></tr>")
+        rows_html = ''.join(risk_rows)
         table = render_table(["Title", "Type", "Score", "Status", "Project", "Actions"], rows_html, "No risks/issues found.")
         uopts=''.join([f"<option value='{u['id']}'>{e(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}'>{e(p['title'])}</option>" for p in projects])
         form = f"<form method='POST' class='form-grid'><div class='field'><label>Title</label><input name='title' required></div><div class='field'><label>Type</label><select name='type'><option>RISK</option><option>ISSUE</option></select></div><div class='field'><label>Project</label><select name='project_id'>{popts}</select></div><div class='field'><label>Owner</label><select name='owner_user_id'>{uopts}</select></div><div class='field'><label>Probability (1-5)</label><input type='number' min='1' max='5' name='probability' value='3'></div><div class='field'><label>Impact (1-5)</label><input type='number' min='1' max='5' name='impact' value='3'></div><div class='field'><label>Due date</label><input type='date' name='due_date'></div><div class='field'><label>Status</label><select name='status'><option>OPEN</option><option>MITIGATED</option><option>CLOSED</option></select></div><div class='field'><label>Description</label><textarea name='description'></textarea></div><div class='field'><label>Mitigation plan</label><textarea name='mitigation_plan'></textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Create risk/issue</button></div></form>"
         body = render_page_header("Risks & Issues", "Monitor delivery exposure and blockers") + render_card("Risk register", table) + render_card("New risk/issue", form)
         return respond(start_response, layout(user, 'Risks & Issues', body, toast_message(environ), path))
+
+
+    if path.startswith('/risks/') and path.endswith('/edit'):
+        rid = int(path.split('/')[2])
+        with get_conn() as conn:
+            r = conn.execute("SELECT * FROM risk_issues WHERE id=? AND deleted_at IS NULL", (rid,)).fetchone()
+            users = conn.execute("SELECT id,name FROM users WHERE is_active=1 ORDER BY name").fetchall(); projects = conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL ORDER BY title").fetchall()
+        if not r:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','Risk/Issue not found.'),active_path=path),'404 Not Found')
+        if not can_edit_entity(user,'risks', r['owner_user_id']):
+            return respond(start_response, layout(user,'Forbidden',render_card('Not allowed',''),active_path=path),'403 Forbidden')
+        if method == 'POST':
+            f=parse_form(environ)
+            owner = r['owner_user_id'] if user.role=='MEMBER' else int(f.get('owner_user_id', r['owner_user_id']))
+            with get_conn() as conn:
+                conn.execute("UPDATE risk_issues SET project_id=?,type=?,title=?,description=?,probability=?,impact=?,status=?,owner_user_id=?,mitigation_plan=?,due_date=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(f.get('project_id')), safe_choice(f.get('type','RISK'),RISK_TYPES,'RISK'), f.get('title',''), f.get('description',''), max(1,min(5,int(f.get('probability','3')))), max(1,min(5,int(f.get('impact','3')))), safe_choice(f.get('status','OPEN'),RISK_STATUS,'OPEN'), owner, f.get('mitigation_plan',''), f.get('due_date') or None, rid))
+            return redirect(start_response, f"/risks/{rid}?toast=Saved")
+        uopts=''.join([f"<option value='{u['id']}' {'selected' if u['id']==r['owner_user_id'] else ''}>{e(u['name'])}</option>" for u in users]); popts=''.join([f"<option value='{p['id']}' {'selected' if r['project_id']==p['id'] else ''}>{e(p['title'])}</option>" for p in projects])
+        form=f"<form method='POST' class='form-grid'><div class='field'><label>Title</label><input name='title' value='{e(r['title'])}' required></div><div class='field'><label>Type</label><select name='type'>" + ''.join([f"<option {'selected' if r['type']==x else ''}>{x}</option>" for x in ['RISK','ISSUE']]) + f"</select></div><div class='field'><label>Project</label><select name='project_id'>{popts}</select></div><div class='field'><label>Owner</label><select name='owner_user_id'>{uopts}</select></div><div class='field'><label>Probability</label><input type='number' min='1' max='5' name='probability' value='{r['probability']}'></div><div class='field'><label>Impact</label><input type='number' min='1' max='5' name='impact' value='{r['impact']}'></div><div class='field'><label>Status</label><select name='status'>" + ''.join([f"<option {'selected' if r['status']==x else ''}>{x}</option>" for x in ['OPEN','MITIGATED','CLOSED']]) + f"</select></div><div class='field'><label>Due date</label><input type='date' name='due_date' value='{e(r['due_date'])}'></div><div class='field'><label>Description</label><textarea name='description'>{e(r['description'])}</textarea></div><div class='field'><label>Mitigation</label><textarea name='mitigation_plan'>{e(r['mitigation_plan'])}</textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Save</button></div></form>"
+        body = render_page_header(f"Edit Risk/Issue: {r['title']}", 'Update risk register item', f"/risks/{rid}") + render_card('Edit risk/issue', form)
+        return respond(start_response, layout(user,'Edit Risk',body,active_path='/risks'))
+
+    if path.startswith('/risks/') and method == 'GET' and path.count('/') == 2:
+        rid = int(path.split('/')[2])
+        with get_conn() as conn:
+            r = conn.execute("SELECT r.*,u.name owner_name,p.title project_title,(r.probability*r.impact) score FROM risk_issues r JOIN users u ON u.id=r.owner_user_id JOIN projects p ON p.id=r.project_id WHERE r.id=? AND r.deleted_at IS NULL", (rid,)).fetchone()
+        if not r:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','Risk/Issue not found.'),active_path=path),'404 Not Found')
+        if not can_view_owned_or_admin_exec(user, r['owner_user_id']):
+            return respond(start_response, layout(user,'Forbidden',render_card('Not allowed',''),active_path=path),'403 Forbidden')
+        actions = (f"<a class='btn btn-sm' href='/risks/{rid}/edit'>Edit</a>" if can_edit_entity(user,'risks',r['owner_user_id']) else '') + (delete_action('risks', rid, False) if can_delete(user,r['owner_user_id']) else '')
+        body = render_page_header(f"Risk/Issue: {r['title']}", 'Risk detail', '/risks') + render_card('Summary', f"<p>{render_badge(r['type'])} {render_badge(r['status'])} {render_badge('Score '+str(r['score']),'amber')}</p><p><b>Project:</b> {e(r['project_title'])}</p><p><b>Owner:</b> {e(r['owner_name'])}</p><p><b>Description:</b> {e(r['description'])}</p><p><b>Mitigation:</b> {e(r['mitigation_plan'])}</p><p><b>Due:</b> {e(r['due_date'])}</p>", actions)
+        return respond(start_response, layout(user,'Risk Detail',body,toast_message(environ),'/risks'))
 
     if path.startswith('/risks/') and path.endswith('/delete') and method == 'POST':
         rid = int(path.split('/')[2])
@@ -435,11 +609,47 @@ def app(environ, start_response):
                 conn.execute("INSERT INTO stakeholders(name,title,org_unit,contact,influence_level,stance,notes) VALUES(?,?,?,?,?,?,?)", (f.get('name', ''), f.get('title', ''), f.get('org_unit', ''), f.get('contact') or None, safe_choice(f.get('influence_level', 'MED'), IMPACT_LEVELS, 'MED'), safe_choice(f.get('stance', 'NEUTRAL'), STANCE, 'NEUTRAL'), f.get('notes', '')))
         with get_conn() as conn:
             rows = conn.execute("SELECT * FROM stakeholders WHERE deleted_at IS NULL ORDER BY created_at DESC").fetchall()
-        rows_html = "".join([f"<tr><td>{e(s['name'])}</td><td>{e(s['title'])}</td><td>{e(s['org_unit'])}</td><td>{render_badge(s['influence_level'])}</td><td>{render_badge(s['stance'])}</td><td class='actions'>{delete_action('stakeholders', s['id'], False) if user.role=='ADMIN' else ''}</td></tr>" for s in rows])
+        stakeholder_rows = []
+        for s in rows:
+            links = action_links(f"/stakeholders/{s['id']}", f"/stakeholders/{s['id']}/edit" if user.role in {'ADMIN','EXEC'} else None, delete_action('stakeholders', s['id'], False) if user.role=='ADMIN' else '')
+            stakeholder_rows.append(f"<tr><td><a href='/stakeholders/{s['id']}'>{e(s['name'])}</a></td><td>{e(s['title'])}</td><td>{e(s['org_unit'])}</td><td>{render_badge(s['influence_level'])}</td><td>{render_badge(s['stance'])}</td><td class='actions'>{links}</td></tr>")
+        rows_html = ''.join(stakeholder_rows)
         table = render_table(["Name", "Title", "Org Unit", "Influence", "Stance", "Actions"], rows_html, "No stakeholders found.")
         form = "<form method='POST' class='form-grid'><div class='field'><label>Name</label><input name='name' required></div><div class='field'><label>Title</label><input name='title'></div><div class='field'><label>Org unit</label><input name='org_unit'></div><div class='field'><label>Contact</label><input name='contact'></div><div class='field'><label>Influence</label><select name='influence_level'><option>LOW</option><option>MED</option><option>HIGH</option></select></div><div class='field'><label>Stance</label><select name='stance'><option>SUPPORTIVE</option><option>NEUTRAL</option><option>RESISTANT</option></select></div><div class='field'><label>Notes</label><textarea name='notes'></textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Create stakeholder</button></div></form>"
         body = render_page_header("Stakeholders", "Map influence and alignment") + render_card("Directory", table) + render_card("New stakeholder", form)
         return respond(start_response, layout(user, 'Stakeholders', body, toast_message(environ), path))
+
+
+    if path.startswith('/stakeholders/') and path.endswith('/edit'):
+        sid = int(path.split('/')[2])
+        with get_conn() as conn:
+            st = conn.execute("SELECT * FROM stakeholders WHERE id=? AND deleted_at IS NULL", (sid,)).fetchone()
+        if not st:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','Stakeholder not found.'),active_path=path),'404 Not Found')
+        if user.role not in {'ADMIN','EXEC'}:
+            return respond(start_response, layout(user,'Forbidden',render_card('Not allowed',''),active_path=path),'403 Forbidden')
+        if method == 'POST':
+            f=parse_form(environ)
+            with get_conn() as conn:
+                conn.execute("UPDATE stakeholders SET name=?,title=?,org_unit=?,contact=?,influence_level=?,stance=?,notes=? WHERE id=?", (f.get('name',''), f.get('title',''), f.get('org_unit',''), f.get('contact') or None, safe_choice(f.get('influence_level','MED'), IMPACT_LEVELS,'MED'), safe_choice(f.get('stance','NEUTRAL'), STANCE,'NEUTRAL'), f.get('notes',''), sid))
+            return redirect(start_response, f"/stakeholders/{sid}?toast=Saved")
+        form=f"<form method='POST' class='form-grid'><div class='field'><label>Name</label><input name='name' value='{e(st['name'])}' required></div><div class='field'><label>Title</label><input name='title' value='{e(st['title'])}'></div><div class='field'><label>Org unit</label><input name='org_unit' value='{e(st['org_unit'])}'></div><div class='field'><label>Contact</label><input name='contact' value='{e(st['contact'])}'></div><div class='field'><label>Influence</label><select name='influence_level'>" + ''.join([f"<option {'selected' if st['influence_level']==x else ''}>{x}</option>" for x in ['LOW','MED','HIGH']]) + f"</select></div><div class='field'><label>Stance</label><select name='stance'>" + ''.join([f"<option {'selected' if st['stance']==x else ''}>{x}</option>" for x in ['SUPPORTIVE','NEUTRAL','RESISTANT']]) + f"</select></div><div class='field'><label>Notes</label><textarea name='notes'>{e(st['notes'])}</textarea></div><div class='field'><label>&nbsp;</label><button class='btn'>Save</button></div></form>"
+        body = render_page_header(f"Edit Stakeholder: {st['name']}", 'Update stakeholder profile', f"/stakeholders/{sid}") + render_card('Edit stakeholder', form)
+        return respond(start_response, layout(user,'Edit Stakeholder',body,active_path='/stakeholders'))
+
+    if path.startswith('/stakeholders/') and method == 'GET' and path.count('/') == 2:
+        sid = int(path.split('/')[2])
+        with get_conn() as conn:
+            st = conn.execute("SELECT * FROM stakeholders WHERE id=? AND deleted_at IS NULL", (sid,)).fetchone()
+            links = conn.execute("SELECT p.id,p.title,ps.relationship_notes FROM project_stakeholders ps JOIN projects p ON p.id=ps.project_id WHERE ps.stakeholder_id=? AND ps.deleted_at IS NULL AND p.deleted_at IS NULL", (sid,)).fetchall()
+        if not st:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','Stakeholder not found.'),active_path=path),'404 Not Found')
+        if user.role == 'MEMBER':
+            return respond(start_response, layout(user,'Forbidden',render_card('Not allowed',''),active_path=path),'403 Forbidden')
+        actions = (f"<a class='btn btn-sm' href='/stakeholders/{sid}/edit'>Edit</a>" if user.role in {'ADMIN','EXEC'} else '') + (delete_action('stakeholders', sid, False) if user.role=='ADMIN' else '')
+        linked = ''.join([f"<li><a href='/projects/{p['id']}'>{e(p['title'])}</a> — {e(p['relationship_notes'])}</li>" for p in links]) or "<li class='empty'>No linked projects.</li>"
+        body = render_page_header(f"Stakeholder: {st['name']}", 'Stakeholder detail', '/stakeholders') + render_card('Summary', f"<p>{render_badge(st['influence_level'])} {render_badge(st['stance'])}</p><p><b>Title:</b> {e(st['title'])}</p><p><b>Org unit:</b> {e(st['org_unit'])}</p><p><b>Contact:</b> {e(st['contact'])}</p><p><b>Notes:</b> {e(st['notes'])}</p>", actions) + render_card('Linked projects', f"<ul>{linked}</ul>")
+        return respond(start_response, layout(user,'Stakeholder Detail',body,toast_message(environ),'/stakeholders'))
 
     if path.startswith('/stakeholders/') and path.endswith('/delete') and method == 'POST':
         sid = int(path.split('/')[2])
@@ -454,14 +664,52 @@ def app(environ, start_response):
         q = parse_qs(environ.get('QUERY_STRING', '')).get('q', [''])[0]
         like = f"%{q}%"
         with get_conn() as conn:
-            p = conn.execute("SELECT title FROM projects WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
-            d = conn.execute("SELECT title FROM decisions WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
-            a = conn.execute("SELECT title FROM action_items WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
-        rows = "".join([f"<tr><td>Project</td><td>{e(x['title'])}</td></tr>" for x in p])
-        rows += "".join([f"<tr><td>Decision</td><td>{e(x['title'])}</td></tr>" for x in d])
-        rows += "".join([f"<tr><td>Action</td><td>{e(x['title'])}</td></tr>" for x in a])
+            p = conn.execute("SELECT id,title FROM projects WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
+            d = conn.execute("SELECT id,title FROM decisions WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
+            a = conn.execute("SELECT id,title FROM action_items WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
+            r = conn.execute("SELECT id,title FROM risk_issues WHERE deleted_at IS NULL AND title LIKE ? LIMIT 10", (like,)).fetchall()
+        rows = "".join([f"<tr><td>Project</td><td><a href='/projects/{x['id']}'>{e(x['title'])}</a></td></tr>" for x in p])
+        rows += "".join([f"<tr><td>Decision</td><td><a href='/decisions/{x['id']}'>{e(x['title'])}</a></td></tr>" for x in d])
+        rows += "".join([f"<tr><td>Action</td><td><a href='/actions/{x['id']}'>{e(x['title'])}</a></td></tr>" for x in a])
+        rows += "".join([f"<tr><td>Risk/Issue</td><td><a href='/risks/{x['id']}'>{e(x['title'])}</a></td></tr>" for x in r])
         body = render_page_header("Search", f"Query: {q}") + render_card("Results", render_table(["Type", "Title"], rows, "No matches."))
         return respond(start_response, layout(user, 'Search', body, active_path=path))
+
+
+    if path.startswith('/admin/users/') and method == 'GET' and path.count('/') == 3:
+        if not can_manage_users(user):
+            return respond(start_response, layout(user, 'Forbidden', render_card('Admins only',''), active_path=path), '403 Forbidden')
+        uid = int(path.split('/')[3])
+        with get_conn() as conn:
+            u = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not u:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','User not found.'),active_path=path),'404 Not Found')
+        actions = f"<a class='btn btn-sm' href='/admin/users/{uid}/edit'>Edit</a>"
+        body = render_page_header(f"User: {u['name']}", 'User detail', '/admin/users') + render_card('Profile', f"<p><b>Email:</b> {e(u['email'])}</p><p><b>Role:</b> {render_badge(u['role'])}</p><p><b>Status:</b> {render_badge('ACTIVE' if u['is_active']==1 else 'DISABLED')}</p><p><b>Created:</b> {e(u['created_at'])}</p>", actions)
+        return respond(start_response, layout(user,'User Detail',body,toast_message(environ),'/admin/users'))
+
+    if path.startswith('/admin/users/') and path.endswith('/edit'):
+        if not can_manage_users(user):
+            return respond(start_response, layout(user, 'Forbidden', render_card('Admins only',''), active_path=path), '403 Forbidden')
+        uid = int(path.split('/')[3])
+        with get_conn() as conn:
+            u = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not u:
+            return respond(start_response, layout(user,'Not found',render_card('Missing','User not found.'),active_path=path),'404 Not Found')
+        if method == 'POST':
+            f = parse_form(environ)
+            with get_conn() as conn:
+                if uid == user.id and f.get('role') != 'ADMIN':
+                    return respond(start_response, layout(user,'Invalid',render_card('Safety check','You cannot demote yourself.'),active_path=path), '400 Bad Request')
+                if f.get('role') != 'ADMIN':
+                    admins = conn.execute("SELECT COUNT(*) c FROM users WHERE role='ADMIN' AND is_active=1").fetchone()['c']
+                    if u['role'] == 'ADMIN' and admins <= 1:
+                        return respond(start_response, layout(user,'Invalid',render_card('Safety check','Cannot demote the last ADMIN.'),active_path=path), '400 Bad Request')
+                conn.execute("UPDATE users SET name=?, role=?, is_active=? WHERE id=?", (f.get('name',''), safe_choice(f.get('role','MEMBER'), {'ADMIN','EXEC','MEMBER'}, 'MEMBER'), 1 if f.get('is_active') == '1' else 0, uid))
+            return redirect(start_response, f"/admin/users/{uid}?toast=Saved")
+        form=f"<form method='POST' class='form-grid'><div class='field'><label>Name</label><input name='name' value='{e(u['name'])}'></div><div class='field'><label>Role</label><select name='role'><option {'selected' if u['role']=='ADMIN' else ''}>ADMIN</option><option {'selected' if u['role']=='EXEC' else ''}>EXEC</option><option {'selected' if u['role']=='MEMBER' else ''}>MEMBER</option></select></div><div class='field'><label>Status</label><select name='is_active'><option value='1' {'selected' if u['is_active']==1 else ''}>active</option><option value='0' {'selected' if u['is_active']==0 else ''}>disabled</option></select></div><div class='field'><label>&nbsp;</label><button class='btn'>Save</button></div></form>"
+        body = render_page_header(f"Edit User: {u['name']}", 'Admin edit user', f"/admin/users/{uid}") + render_card('Edit user', form)
+        return respond(start_response, layout(user,'Edit User',body,active_path='/admin/users'))
 
     if path == '/admin/users':
         if not can_manage_users(user):
@@ -491,7 +739,7 @@ def app(environ, start_response):
         for u in users:
             edit = f"<form method='POST' class='form-grid'><input type='hidden' name='action' value='edit'><input type='hidden' name='user_id' value='{u['id']}'><div class='field'><label>Name</label><input name='name' value='{e(u['name'])}'></div><div class='field'><label>Role</label><select name='role'><option {'selected' if u['role']=='ADMIN' else ''}>ADMIN</option><option {'selected' if u['role']=='EXEC' else ''}>EXEC</option><option {'selected' if u['role']=='MEMBER' else ''}>MEMBER</option></select></div><div class='field'><label>Status</label><select name='is_active'><option value='1' {'selected' if u['is_active']==1 else ''}>active</option><option value='0' {'selected' if u['is_active']==0 else ''}>disabled</option></select></div><div class='field'><label>&nbsp;</label><button class='btn btn-sm'>Save</button></div></form>"
             reset = f"<form method='POST' class='toolbar'><input type='hidden' name='action' value='reset_password'><input type='hidden' name='user_id' value='{u['id']}'><input name='temp_password' placeholder='Temp password' required><button class='btn btn-sm'>Reset password</button></form>"
-            rows.append(f"<tr><td>{e(u['name'])}</td><td>{e(u['email'])}</td><td>{render_badge(u['role'])}</td><td>{e(u['created_at'])}</td><td>{edit}{reset}</td></tr>")
+            rows.append(f"<tr><td>{e(u['name'])}</td><td>{e(u['email'])}</td><td>{render_badge(u['role'])}</td><td>{e(u['created_at'])}</td><td class='actions'><a class='btn btn-sm btn-ghost' href='/admin/users/{u['id']}'>View</a><a class='btn btn-sm' href='/admin/users/{u['id']}/edit'>Edit</a>{reset}</td></tr>")
         search_bar = f"<form method='GET' class='toolbar'><div class='field'><label>Search users</label><input name='q' value='{e(q)}' placeholder='name or email'></div><button class='btn'>Search</button></form>"
         table = render_table(["Name", "Email", "Role", "Created", "Manage"], "".join(rows), "No users found.")
         create = "<form method='POST' class='form-grid'><input type='hidden' name='action' value='create'><div class='field'><label>Name</label><input name='name' required></div><div class='field'><label>Email</label><input type='email' name='email' required></div><div class='field'><label>Role</label><select name='role'><option>ADMIN</option><option>EXEC</option><option>MEMBER</option></select></div><div class='field'><label>Temporary password</label><input name='temp_password' required></div><div class='field'><label>&nbsp;</label><button class='btn'>Create user</button></div></form>"
